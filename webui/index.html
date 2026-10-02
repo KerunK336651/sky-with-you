@@ -1,0 +1,334 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>sky-with-you 调试台</title>
+<style>
+  :root {
+    --bg: #0f1620;
+    --panel: #18222e;
+    --panel2: #1e2a38;
+    --border: #2a3947;
+    --text: #d7e0ea;
+    --muted: #7d8da0;
+    --accent: #2fb5b0;
+    --accent2: #26948f;
+    --green: #4caf7d;
+    --red: #d36a6a;
+    --amber: #d9a441;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+    font-size: 14px;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 18px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .conn { display: flex; gap: 12px; margin-left: auto; font-size: 13px; }
+  .conn span { display: flex; align-items: center; gap: 6px; color: var(--muted); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--green); }
+  .dot.off { background: var(--red); }
+
+  main {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 14px;
+    padding: 14px; align-items: start;
+  }
+  @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 14px; margin-bottom: 14px;
+  }
+  .card h2 {
+    font-size: 13px; margin: 0 0 12px; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .5px; font-weight: 600;
+  }
+
+  .btn-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 7px; }
+  .btn-grid.cols4 { grid-template-columns: repeat(4, 1fr); }
+  .btn-grid.cols3 { grid-template-columns: repeat(3, 1fr); }
+  button.act {
+    background: var(--panel2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 7px;
+    padding: 10px 4px; font-size: 14px; cursor: pointer;
+    transition: background .12s, border-color .12s;
+  }
+  button.act:hover { background: #263444; border-color: var(--accent2); }
+  button.act:active { background: var(--accent2); }
+  button.act.wide { grid-column: span 2; }
+  button.act.go { color: #8fd4d1; }
+  button.act.flash { animation: flash .4s; }
+  @keyframes flash { 0% { background: var(--accent2); } 100% { background: var(--panel2); } }
+
+  .sub { color: var(--muted); font-size: 12px; margin: 12px 0 7px; }
+  .send-row { display: flex; gap: 7px; }
+  .send-row input {
+    flex: 1; background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 7px; padding: 10px; color: var(--text); font-size: 14px;
+  }
+  .send-row input:focus { outline: none; border-color: var(--accent2); }
+  .send-row button {
+    background: var(--accent); color: #062827; border: none; border-radius: 7px;
+    padding: 0 18px; font-size: 14px; font-weight: 600; cursor: pointer;
+  }
+  .send-row button:hover { background: var(--accent2); color: #fff; }
+
+  .status-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 7px 2px; border-bottom: 1px solid #202c39;
+  }
+  .status-row:last-child { border-bottom: none; }
+  .status-row .k { color: var(--muted); }
+  .status-row .v { display: flex; align-items: center; gap: 7px; font-weight: 500; }
+  .tag {
+    font-size: 12px; padding: 2px 8px; border-radius: 10px;
+    background: var(--panel2); color: var(--muted); border: 1px solid var(--border);
+  }
+  .tag.good { color: var(--green); border-color: #2c5444; }
+  .tag.warn { color: var(--amber); border-color: #5a4a28; }
+  .tag.bad { color: var(--red); border-color: #5a3333; }
+
+  #frame { width: 100%; border-radius: 8px; display: block; }
+  .frame-bar { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .frame-bar button {
+    background: var(--panel2); color: var(--text); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 12px; cursor: pointer; font-size: 13px;
+  }
+  .frame-bar label { color: var(--muted); font-size: 13px; display: flex; gap: 5px; align-items: center; cursor: pointer; }
+
+  #logs {
+    background: #0b121a; border: 1px solid var(--border); border-radius: 8px;
+    height: 260px; overflow-y: auto; padding: 10px 12px;
+    font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+    line-height: 1.55; white-space: pre-wrap; word-break: break-all;
+  }
+  #logs .ln { color: #9fb0c0; }
+  #logs .ln .actname { color: var(--accent); }
+</style>
+</head>
+<body>
+<header>
+  <h1>sky-with-you 调试台</h1>
+  <div class="conn">
+    <span><span class="dot" id="d-mcp"></span>MCP</span>
+    <span><span class="dot" id="d-det"></span>感知</span>
+    <span><span class="dot" id="d-yolo"></span>YOLO</span>
+  </div>
+</header>
+
+<main>
+  <!-- 左：动作 -->
+  <div>
+    <div class="card">
+      <h2>基础按键</h2>
+      <div class="sub">常用</div>
+      <div class="btn-grid">
+        <button class="act" data-key="c">C</button>
+        <button class="act" data-key="f">F</button>
+        <button class="act" data-key="space">空格</button>
+        <button class="act" data-key="enter">回车</button>
+        <button class="act" data-key="escape">ESC</button>
+      </div>
+      <div class="sub">方向键</div>
+      <div class="btn-grid cols4">
+        <button class="act" data-key="up">上</button>
+        <button class="act" data-key="down">下</button>
+        <button class="act" data-key="left">左</button>
+        <button class="act" data-key="right">右</button>
+      </div>
+      <div class="sub">数字 / 表情键</div>
+      <div class="btn-grid">
+        <button class="act" data-key="1">1</button>
+        <button class="act" data-key="2">2</button>
+        <button class="act" data-key="3">3</button>
+        <button class="act" data-key="4">4</button>
+        <button class="act" data-key="5">5</button>
+        <button class="act" data-key="8">8</button>
+        <button class="act" data-key="s">S</button>
+        <button class="act" data-key="w">W</button>
+        <button class="act" data-key="a">A</button>
+        <button class="act" data-key="d">D</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>面板</h2>
+      <div class="btn-grid cols3">
+        <button class="act" data-action="open_panel">开面板</button>
+        <button class="act" data-action="close_panel">关面板</button>
+        <button class="act" data-action="focus">聚焦游戏</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>发送消息</h2>
+      <div class="send-row">
+        <input id="msg" type="text" placeholder="输入要发送的内容…" autocomplete="off">
+        <button id="send">发送</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>高级动作（完整流程）</h2>
+      <div class="btn-grid cols3">
+        <button class="act go" data-action="go_home">回遇境</button>
+        <button class="act go" data-action="friend_tree" data-act="抱抱">发起抱抱</button>
+        <button class="act go" data-action="confirm">确认弹窗</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 右：状态 + 画面 + 日志 -->
+  <div>
+    <div class="card">
+      <h2>实时状态</h2>
+      <div id="status">
+        <div class="status-row"><span class="k">场景</span><span class="v"><span class="tag" id="s-screen">—</span></span></div>
+        <div class="status-row"><span class="k">聊天面板</span><span class="v" id="s-chat">—</span></div>
+        <div class="status-row"><span class="k">好友树</span><span class="v" id="s-tree">—</span></div>
+        <div class="status-row"><span class="k">确认弹窗</span><span class="v" id="s-confirm">—</span></div>
+        <div class="status-row"><span class="k">F 提示</span><span class="v" id="s-fprompt">—</span></div>
+        <div class="status-row"><span class="k">牵手状态</span><span class="v" id="s-holding">—</span></div>
+        <div class="status-row"><span class="k">姿势</span><span class="v" id="s-pose">—</span></div>
+        <div class="status-row"><span class="k">YOLO 牵手</span><span class="v" id="s-yhand">—</span></div>
+        <div class="status-row"><span class="k">YOLO 好友树入口</span><span class="v" id="s-ytree">—</span></div>
+        <div class="status-row"><span class="k">YOLO 输入框</span><span class="v" id="s-ychat">—</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>当前画面</h2>
+      <img id="frame" alt="画面">
+      <div class="frame-bar">
+        <button id="shot">刷新截图</button>
+        <label><input type="checkbox" id="autoshot">自动刷新（1秒）</label>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>日志</h2>
+      <div id="logs"></div>
+    </div>
+  </div>
+</main>
+
+<script>
+function postAction(body) {
+  fetch("/api/action", {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  }).then(r => r.json()).then(d => {
+    if (!d.queued) console.warn("队列失败", d);
+  });
+}
+
+function flash(btn) {
+  btn.classList.remove("flash"); void btn.offsetWidth; btn.classList.add("flash");
+}
+
+document.querySelectorAll("button.act").forEach(btn => {
+  btn.addEventListener("click", () => {
+    flash(btn);
+    if (btn.dataset.key) {
+      postAction({ action: "press", params: { key: btn.dataset.key } });
+    } else if (btn.dataset.action === "friend_tree") {
+      postAction({ action: "friend_tree", params: { act: btn.dataset.act } });
+    } else {
+      postAction({ action: btn.dataset.action, params: {} });
+    }
+  });
+});
+
+function sendMsg() {
+  const inp = document.getElementById("msg");
+  const text = inp.value.trim();
+  if (!text) return;
+  postAction({ action: "send_msg", params: { text: text } });
+  inp.value = "";
+}
+document.getElementById("send").addEventListener("click", sendMsg);
+document.getElementById("msg").addEventListener("keydown", e => {
+  if (e.key === "Enter") sendMsg();
+});
+
+const SCREEN = { UNKNOWN: "未知", LOADING: "加载中", HOME: "遇境", IN_WORLD: "游戏中" };
+const POSE = { standing: "站立", crouching: "蹲下", sitting: "坐下", lying: "躺下" };
+
+function dot(id, on) {
+  const el = document.getElementById(id);
+  el.className = "dot " + (on ? "on" : "off");
+}
+
+function chTag(ch, label) {
+  if (!ch) return "—";
+  if (ch.value) return `<span class="tag good">开 ${ch.conf}</span>`;
+  return `<span class="tag">关 ${ch.conf}</span>`;
+}
+function yoloTag(y) {
+  if (!y) return "—";
+  if (y.detected) return `<span class="tag good">${y.conf}</span>`;
+  return `<span class="tag">无</span>`;
+}
+
+function render(d) {
+  dot("d-mcp", d.mcp_ok);
+  dot("d-det", d.detector);
+  dot("d-yolo", d.yolo && d.yolo.model_loaded);
+
+  const w = d.world, st = d.state, y = d.yolo;
+  document.getElementById("s-screen").textContent = w ? (SCREEN[w.screen] || w.screen) : "—";
+  if (w) {
+    document.getElementById("s-chat").innerHTML = chTag(w.chat_open);
+    document.getElementById("s-tree").innerHTML = chTag(w.friend_tree);
+    document.getElementById("s-confirm").innerHTML = chTag(w.confirm_dialog);
+    let fp = chTag(w.f_prompt);
+    if (w.f_prompt.value && w.f_prompt_name) fp += ` <span class="tag warn">${w.f_prompt_name}</span>`;
+    document.getElementById("s-fprompt").innerHTML = fp;
+  }
+  if (st) {
+    document.getElementById("s-holding").innerHTML = st.is_holding_hands
+      ? '<span class="tag good">牵手中</span>' : '<span class="tag">未牵手</span>';
+    document.getElementById("s-pose").innerHTML =
+      `<span class="tag">${POSE[st.pose_state] || st.pose_state}</span>`;
+  }
+  if (y) {
+    document.getElementById("s-yhand").innerHTML = yoloTag(y.hand);
+    document.getElementById("s-ytree").innerHTML = yoloTag(y.open_tree);
+    document.getElementById("s-ychat").innerHTML = yoloTag(y.chat_input);
+  }
+
+  // 日志：全量重绘（200 条内），自动滚底
+  const logs = document.getElementById("logs");
+  const atBottom = logs.scrollTop + logs.clientHeight >= logs.scrollHeight - 30;
+  logs.innerHTML = d.logs.map(l =>
+    `<span class="ln">${l.replace(/&/g, "&amp;").replace(/</g, "&lt;")}</span>`
+  ).join("\n");
+  if (atBottom) logs.scrollTop = logs.scrollHeight;
+}
+
+function poll() {
+  fetch("/api/state").then(r => r.json()).then(render)
+    .catch(() => { dot("d-mcp", false); });
+}
+setInterval(poll, 800);
+poll();
+
+// 截图
+const frame = document.getElementById("frame");
+function refreshFrame() { frame.src = "/api/frame.jpg?t=" + Date.now(); }
+document.getElementById("shot").addEventListener("click", refreshFrame);
+let frameTimer = null;
+document.getElementById("autoshot").addEventListener("change", e => {
+  if (e.target.checked) { refreshFrame(); frameTimer = setInterval(refreshFrame, 1000); }
+  else { clearInterval(frameTimer); }
+});
+</script>
+</body>
+</html>
