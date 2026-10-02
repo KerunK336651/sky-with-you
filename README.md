@@ -6,6 +6,10 @@
 TA 会自己看聊天面板、回你的消息、点火收火、鞠躬、接受你的传送邀请、
 牵住你伸出的手，或者说一句"走，回家"然后带你回遇境。
 
+> **来源说明**：本项目是在开源项目基础上的二次修改，由 **珂珂**
+> （[KerunK336651](https://github.com/KerunK336651)）改动、调试与维护。
+> 原始项目与各部分来源见文末「致谢与来源」。
+
 ## 原理
 
 三层结构，全部在游戏同一台 Windows 机器上运行：
@@ -87,16 +91,25 @@ python sky-loop-v7.py
 - **牵手回家最省事的姿势**：牵着手之后盯着 TA——等 TA 先做出回家动作，
   你再跟着回，两个人的手全程不会断（游戏已支持牵手过传送不松手）
 
-## 致谢
+## 致谢与来源
 
-- 本项目的执行层（MCP server + 键盘注入）基于
-  [Aevella/sky-pc-mcp-companion](https://github.com/Aevella/sky-pc-mcp-companion)
-  改造而来，感谢 Aevella 老师的原始工作。
-  感知层（panel_detector）、调度层（sky-loop-v7）与固件 v2 为本项目新写。
+本项目是站在几位开源作者的肩膀上，由 **珂珂**（[KerunK336651](https://github.com/KerunK336651)）二次修改、调试与维护。感谢以下开源项目：
+
+| 来源项目 | 贡献了什么 |
+|---|---|
+| [akini a0315/sky-with-you](https://github.com/akini a0315/sky-with-you) | 原始项目框架（项目名、整体结构、README 基础），MIT 协议 |
+| [112Alan/sky-companion](https://github.com/112Alan/sky-companion) | 聊天引擎、长期记忆、回复处理、风格学习、联网搜索（`core/` 移植自其 `user_settings.py`、`ocr_agent.py`），MIT 协议 |
+| [Aevella/sky-pc-mcp-companion](https://github.com/Aevella/sky-pc-mcp-companion) | 执行层 MCP server 与键盘注入（`sky-mcp-server.py`） |
+
+以下部分为本项目新写或大幅改动：感知层 `panel_detector.py`、固件 `firmware/sky_keyboard_v2.ino`、
+YOLO 视觉识别、动作（牵手 / 坐下 / 抱抱 / 回遇境）逻辑；调度层 `sky-loop-v7.py` 在原框架上
+移植了 sky-companion 聊天引擎并持续迭代。
+
+再次感谢 akinia0315、112Alan、Aevella 三位作者的原始工作。
 
 ## 作者的话
 
-（人暂时不在，看机写的版本吧）
+珂珂（KerunK336651），在原项目基础上一点点改出来的。
 
 ## 免责声明
 
