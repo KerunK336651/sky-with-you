@@ -1,0 +1,8 @@
+本目录由程序运行时自动生成，用于存放个人数据，只留在本机、不入库：
+
+  memory.json           长期记忆（含私人聊天内容，勿上传）
+  mem_uuid_map.json     玩家标识 / 白名单映射
+  search_knowledge.json 联网搜索知识摘要
+  style_knowledge.json  学习到的说话风格
+
+以上文件已被 .gitignore 忽略。首次运行 sky-loop-v7.py 时会自动创建。

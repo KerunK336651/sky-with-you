@@ -1,0 +1,19 @@
+# 感知 + 调度（panel_detector.py / sky-loop-v7.py）
+numpy
+opencv-python
+mss
+rapidocr_onnxruntime
+openai
+requests
+# YOLO 牵手/输入框检测（默认开启；不装则自动退回模板匹配，torch 会作为依赖一并安装，较大）
+ultralytics
+
+# 执行层（sky-mcp-server.py）
+pyserial
+pyperclip
+pyautogui
+PyGetWindow
+pywin32; platform_system == "Windows"
+
+# 软件按键回退（无 Arduino 时；光遇 Raw Input 下 pyautogui 键盘部分可用、pydirectinput 更稳）
+pydirectinput

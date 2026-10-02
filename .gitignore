@@ -1,0 +1,54 @@
+# ── 密钥（只住在本机）────────────────────────────
+key.txt
+vision_key.txt
+
+# ── 个人人设（仓库只提供 persona.example.txt 模板）──
+persona.txt
+
+# ── 个人记忆 / 知识库（运行时生成，含私人聊天）──────
+user_data/*
+!user_data/放图说明.txt
+
+# ── 内部交接文档（含个人信息与开发历史）─────────────
+PROJECT_HANDOFF.md
+回家操作说明.txt
+
+# ── 大文件 / 工具链 / 模型权重（不入库，获取方式见 README）
+*.exe
+*.pt
+runs/
+
+# ── 调试取证与标定截图（含聊天记录，永不上传）──────
+flip_debug/
+/*.png
+/*.jpg
+
+# ── 临时脚本输出（可复跑生成）────────────────────
+*_log.txt
+mem_diag.txt
+mem_diag2.txt
+mem_scan_result.txt
+anchor_eval_result.txt
+memory_test_result.txt
+
+# ── 内部工作手册与旧版 ───────────────────────────
+CLAUDE.md
+sky-loop.py
+test-local.py
+start-http.bat
+start-stdio.bat
+
+__pycache__/
+*.pyc
+
+# ── 启动日志（本地排查用）────────────────────────
+logs/
+
+# ── 测试 / 基准输出目录（可复跑生成）──────────────
+_ocr_test_out/
+_ocr_bench/
+_eval_selftest/
+ocr_real_shots/*
+!ocr_real_shots/放图说明.txt
+panel_close_debug/
+friend_tree_debug/
