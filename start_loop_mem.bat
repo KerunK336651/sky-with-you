@@ -1,17 +1,17 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title Sky Loop v7.1 (å†…å­˜è¯»å–æ¨¡å¼)
+title Sky Loop v7.1 (ÄÚ´æ¶ÁÈ¡Ä£Ê½)
 
-:: æ£€æŸ¥ç®¡ç†å‘˜æƒé™
+:: ¼ì²é¹ÜÀíÔ±È¨ÏŞ
 net session >nul 2>&1
 if %errorLevel% neq 0 (
     echo ========================================
-    echo   Sky Loop v7.1 - å†…å­˜è¯»å–æ¨¡å¼
+    echo   Sky Loop v7.1 - ÄÚ´æ¶ÁÈ¡Ä£Ê½
     echo ========================================
     echo.
-    echo å†…å­˜è¯»å–éœ€è¦ç®¡ç†å‘˜æƒé™ã€‚
-    echo å³å°†è¯·æ±‚ç®¡ç†å‘˜æƒé™ï¼Œè¯·åœ¨ UAC å¼¹çª—ä¸­ç‚¹å‡»"æ˜¯"ã€‚
+    echo ÄÚ´æ¶ÁÈ¡ĞèÒª¹ÜÀíÔ±È¨ÏŞ¡£
+    echo ¼´½«ÇëÇó¹ÜÀíÔ±È¨ÏŞ£¬ÇëÔÚ UAC µ¯´°ÖĞµã»÷"ÊÇ"¡£
     echo.
     timeout /t 2 /nobreak >nul
     powershell -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
@@ -31,16 +31,16 @@ set SKY_LLM_MODEL=deepseek-v4-flash
 set SKY_INPUT_BACKEND=arduino
 set SKY_SEARCH_ENABLED=1
 set SKY_WHITELIST_ENABLED=1
-set SKY_WHITELIST=ç‚ç‚,å¹ºå¹º,é˜¿é¢œ
+set SKY_WHITELIST=çæçæ,çÛçÛ,°¢ÑÕ
 set SKY_MEM_READER=1
 
 echo Current config:
 echo   LLM: %SKY_LLM_PROVIDER% / %SKY_LLM_MODEL%
 echo   Input backend: %SKY_INPUT_BACKEND%
-echo   Chat input: Memory Reader (éœ€è¦ç®¡ç†å‘˜æƒé™)
+echo   Chat input: Memory Reader (ĞèÒª¹ÜÀíÔ±È¨ÏŞ)
 echo   Web search: %SKY_SEARCH_ENABLED%
 echo   Whitelist: %SKY_WHITELIST_ENABLED% (%SKY_WHITELIST%)
-echo   Player: ç‚ç‚  AI: æ˜Ÿæ²³
+echo   Player: çæçæ  AI: ĞÇºÓ
 echo.
 
 if not exist key.txt (

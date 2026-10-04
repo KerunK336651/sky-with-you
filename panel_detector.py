@@ -362,6 +362,10 @@ class WorldState:
         self.screen_since = time.time()
         self.confirm_text = ""
         self.confirm_keywords: tuple = ()
+        # 弹窗视觉疑似状态（由 process_frame 每帧更新）：OCR 关键词必须配合视觉疑似，
+        # 否则聊天内容里的"接受/加入/邀请"等词会误判成弹窗、自动按空格
+        self.dialog_visual_score = 0.0   # 最近 confirm 模板匹配分
+        self.dialog_edge_suspect = False # 弹窗区域边缘疑似
         self.f_prompt_name = ""
         self.frame_seq = 0
         self.ts = 0.0
@@ -731,6 +735,8 @@ class PanelDetector:
                     w._emit("confirm", False, True)
                 dialog_suspect = True
         with w._lock:
+            w.dialog_visual_score = float(m.get("tmpl_confirm", 0.0))
+            w.dialog_edge_suspect = bool(dialog_suspect)
             active_confirm = w.confirm.value
         if dialog_suspect or active_confirm:
             if now - self._last_dialog_ocr > self.cfg.ocr_dialog_cooldown:
@@ -1033,14 +1039,25 @@ class PanelDetector:
             # 回家后 kw=传送 反复触发接弹窗，space+f 全按在星盘上）。
             # 在家时"传送"不算证据；真弹窗还有模板匹配和其他关键词兜底。
             hit_confirm = tuple(k for k in hit_confirm if k != "传送")
+        # 全屏 OCR 必须配合视觉疑似（聊天内容里的"接受/加入/邀请"等不算弹窗）；
+        # dialog 加急 OCR 本就是视觉疑似后才跑，直接确认
+        if scope == "full":
+            visual_suspect = (
+                w.dialog_visual_score >= self.cfg.template_threshold * 0.7
+                or w.dialog_edge_suspect)
+        else:
+            visual_suspect = True
         if hit_confirm and not is_chat_ui_only and not is_transition \
-                and not in_loading:
+                and not in_loading and visual_suspect:
             with w._lock:
                 changed = w.confirm.evidence(0.9, f"ocr:{scope}", now)
                 w.confirm_text = joined[:300]
                 w.confirm_keywords = hit_confirm
             if changed:
                 w._emit("confirm", False, True)
+        elif hit_confirm and not visual_suspect:
+            print(f"  [PD] 命中确认词『{'/'.join(hit_confirm)}』但无弹窗视觉特征，"
+                  f"判为聊天内容、不按空格")
 
         if scope != "full":
             return

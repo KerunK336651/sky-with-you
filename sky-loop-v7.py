@@ -1355,7 +1355,12 @@ def _execute_reply(det, state, sess, reply):
                     time.sleep(2.0)  # 等游戏稳定
                     print("  [Action] 回遇境后打开聊天面板")
                     _key(sess, "c", 150)
-                    time.sleep(1.0)
+                    time.sleep(1.2)
+                    # 确认面板打开，没打开再试一次（守门在 HOME 场景也会兜底）
+                    if panel_open(det) is not True:
+                        print("  [Action] 面板还没打开，再按一次 C")
+                        _key(sess, "c", 150)
+                        time.sleep(1.2)
                     break
                 else:
                     print("  [Action] 10秒内没见到传送过场，重新执行回遇境")
@@ -1729,6 +1734,7 @@ def read_chat_ocr(frame, ocr_engine, roi):
     img = crop_roi_3x(frame, roi)
     variants = build_ocr_variants(img)
     best, best_score = [], -1
+    early_counts = []  # 前两个变体(gray/sharp)的识别行数
     for name, im in variants:
         result, _ = ocr_engine(im)
         result = result or []
@@ -1743,6 +1749,14 @@ def read_chat_ocr(frame, ocr_engine, roi):
             best_score, best = score, result
         # gray 或 sharp 效果好就提前退出，省时间
         if name in ("gray", "sharp") and len(result) >= 3 and avg_conf > 0.60:
+            break
+        # gray、sharp 都识别出了较多行且数量接近（两种预处理结果一致、识别稳定）：
+        # 不再跑后面 5 个变体——多人 20+ 行时这是主要耗时来源（曾表现为"多人卡死"）
+        if name in ("gray", "sharp"):
+            early_counts.append(len(result))
+        if name == "sharp" and len(early_counts) == 2 \
+                and min(early_counts) >= 3 \
+                and abs(early_counts[0] - early_counts[1]) <= 2:
             break
     if not best:
         return []
@@ -1805,6 +1819,34 @@ def _maybe_update_memory(state, llm_client, force=False):
         state.memory_updating = False
 
 # ===================== WatchThread =====================
+
+def _guard_should_reopen(snap, panel_state, panel_closed_since, t0,
+                         busy, sending, action_empty,
+                         last_action, last_reopen):
+    """守门：判断此刻是否应按 C 重新打开聊天面板（纯函数，便于离线测试）。
+    只在 IN_WORLD / HOME 场景、面板持续关 PANEL_REOPEN_DELAY、且无弹窗/好友树/
+    动作/发送/内存模式占用时才触发。HOME 场景必须包含——否则回遇境后面板一旦
+    关闭就再也打不开（真机 2026-10-03 卡住根因）。"""
+    if snap.screen not in (Screen.IN_WORLD, Screen.HOME):
+        return False
+    if panel_state is not False:
+        return False
+    if snap.confirm_dialog.value or snap.friend_tree.value:
+        return False
+    if panel_closed_since is None:
+        return False
+    if t0 - panel_closed_since <= PANEL_REOPEN_DELAY:
+        return False
+    if busy or sending or not action_empty:
+        return False
+    if MEM_READER_ENABLED:
+        return False
+    if t0 - last_action <= POST_ACTION_GRACE:
+        return False
+    if t0 - last_reopen <= REOPEN_COOLDOWN:
+        return False
+    return True
+
 
 def watch_loop(det: PanelDetector, state: SharedState,
                ocr_q: queue.Queue, action_q: queue.Queue):
@@ -1991,8 +2033,8 @@ def watch_loop(det: PanelDetector, state: SharedState,
                                          - last_gray.astype(float)).mean())
                         need = d > 4.5
                     last_gray = g
-                if (need and t0 - last_ocr > OCR_COOLDOWN) \
-                        or t0 - last_ocr > OCR_FALLBACK:
+                if ocr_q.empty() and ((need and t0 - last_ocr > OCR_COOLDOWN) \
+                        or t0 - last_ocr > OCR_FALLBACK):
                     try:
                         ocr_q.put_nowait(("chat",))
                     except queue.Full:
@@ -2001,9 +2043,11 @@ def watch_loop(det: PanelDetector, state: SharedState,
                 last_gray = None
                 # 持续关迟滞：必须连续 PANEL_REOPEN_DELAY 都判关才认为真关；
                 # 瞬时漏检/抖动期间保持 None 不按C，避免把其实开着的面板按关
-                if (snap.screen == Screen.IN_WORLD
-                        and panel_open(det) is False
-                        and not snap.confirm_dialog.value):
+                pstate = panel_open(det)
+                if (snap.screen in (Screen.IN_WORLD, Screen.HOME)
+                        and pstate is False
+                        and not snap.confirm_dialog.value
+                        and not snap.friend_tree.value):
                     if panel_closed_since is None:
                         panel_closed_since = t0
                 else:
@@ -2011,15 +2055,10 @@ def watch_loop(det: PanelDetector, state: SharedState,
                 with state.lock:
                     last_reopen = state.last_reopen_time
                     last_action = state.last_action_end
-                if (snap.screen == Screen.IN_WORLD
-                        and panel_closed_since is not None
-                        and t0 - panel_closed_since > PANEL_REOPEN_DELAY
-                        and not busy
-                        and not _sending_msg
-                        and action_q.empty()
-                        and not MEM_READER_ENABLED
-                        and t0 - last_action > POST_ACTION_GRACE
-                        and t0 - last_reopen > REOPEN_COOLDOWN):
+                if _guard_should_reopen(
+                        snap, pstate, panel_closed_since, t0,
+                        busy, _sending_msg, action_q.empty(),
+                        last_action, last_reopen):
                     panel_closed_since = None
                     with state.lock:
                         state.last_reopen_time = t0

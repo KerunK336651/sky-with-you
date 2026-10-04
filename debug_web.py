@@ -240,25 +240,104 @@ def _mcp_alive():
         return False
 
 
-def _focus_game():
-    try:
-        sky.mcp("focus_game", session=sess)
-        time.sleep(0.5)
+def _find_game_hwnd():
+    """枚举顶层窗口，返回游戏窗口 hwnd（排除控制台）。"""
+    import ctypes
+    from ctypes import wintypes
+    user32 = ctypes.windll.user32
+    titles = ("光·遇", "Sky: Children of the Light", "光遇", "Sky")
+    console_classes = {"ConsoleWindowClass", "CASCADIA_HOSTING_WINDOW_CLASS"}
+    found = []
+
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    def cb(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        buf = ctypes.create_unicode_buffer(256)
+        user32.GetWindowTextW(hwnd, buf, 256)
+        title = buf.value
+        if not title:
+            return True
+        cls = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, cls, 256)
+        if cls.value in console_classes:
+            return True
+        for pri, t in enumerate(titles):
+            if title == t:
+                found.append((pri, hwnd))
+                break
+            if len(t) >= 8 and t in title:
+                found.append((pri + 100, hwnd))
+                break
         return True
-    except Exception as e:
-        log(f"focus_game 失败: {e}")
-        return False
+
+    user32.EnumWindows(cb, 0)
+    if not found:
+        return None
+    found.sort(key=lambda x: x[0])
+    return found[0][1]
+
+
+def _force_foreground(hwnd):
+    """强制把 hwnd 切到前台（AttachThreadInput 绕过 Windows 前台锁定）。"""
+    import ctypes
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    fg = user32.GetForegroundWindow()
+    cur_tid = kernel32.GetCurrentThreadId()
+    fg_tid = user32.GetWindowThreadProcessId(fg, None)
+    tgt_tid = user32.GetWindowThreadProcessId(hwnd, None)
+    attached_fg = False
+    attached_tgt = False
+    if fg_tid != cur_tid:
+        user32.AttachThreadInput(cur_tid, fg_tid, True)
+        attached_fg = True
+    if tgt_tid != cur_tid and tgt_tid != fg_tid:
+        user32.AttachThreadInput(cur_tid, tgt_tid, True)
+        attached_tgt = True
+    user32.BringWindowToTop(hwnd)
+    user32.SetForegroundWindow(hwnd)
+    user32.SetActiveWindow(hwnd)
+    if attached_fg:
+        user32.AttachThreadInput(cur_tid, fg_tid, False)
+    if attached_tgt:
+        user32.AttachThreadInput(cur_tid, tgt_tid, False)
+
+
+def _focus_game():
+    # 本地强制切前台：Arduino 模式下 MCP 设了 SKY_SKIP_FOCUS=1，focus_game 不真正切，
+    # 所以必须由调试台自己把游戏切到前台，否则按键会进浏览器而非游戏。
+    hwnd = _find_game_hwnd()
+    if hwnd:
+        try:
+            _force_foreground(hwnd)
+        except Exception as e:
+            log(f"本地切前台异常: {e}")
+        time.sleep(0.6)
+    else:
+        log("没找到游戏窗口，无法切前台")
+    # 再通知 MCP（仅在可连时，避免长重试；被 SKY_SKIP_FOCUS 跳过也无害）
+    if _mcp_alive():
+        try:
+            sky.mcp("focus_game", session=sess)
+            time.sleep(0.3)
+        except Exception as e:
+            log(f"MCP focus_game 提示失败（可忽略）: {e}")
+    return hwnd is not None
 
 
 def _execute(action, params):
+    # focus 是纯本地切前台，不依赖 MCP
+    if action == "focus":
+        _focus_game()
+        return
     if not _mcp_alive():
         log("MCP 未连接，跳过动作（先开 sky-mcp-server）")
         return
-    if det is None and action not in ("press", "focus"):
+    if det is None and action != "press":
         log(f"无感知器，动作 {action} 可能不可用")
     _focus_game()
-    if action == "focus":
-        return
     if action == "press":
         key = params.get("key")
         ms = int(params.get("ms", 80))
