@@ -294,6 +294,7 @@ class SharedState:
         self.pose_state: str = "standing"  # standing/crouching/sitting/lying
         self.pose_update_time: float = 0
         self.pose_need_retry: bool = False  # 需要重试姿势动作（玩家说没成功时）
+        self.pose_last_target: str = ""  # 最近一次姿势目标（玩家反馈时据此判断补按）
 
         # ── 回遇境完成标志（让AI知道刚刚回到遇境）──
         self.gohome_completed: bool = False  # 回遇境成功后设为True，AI回复后清除
@@ -444,7 +445,8 @@ def _ensure_panel_open_for_watch(det, sess, timeout=5.0, need=2, gap=0.15,
 def _open_panel(det, sess, state) -> bool:
     snap = det.world.snapshot()
     # 加载/过场/传送确认弹窗/非游戏内：按C无意义还会捣乱，一律不动面板
-    if snap.screen != Screen.IN_WORLD or snap.confirm_dialog.value:
+    # HOME（遇境）也有聊天面板，守门需要能在遇境重开（回遇境/牵手后）
+    if snap.screen not in (Screen.IN_WORLD, Screen.HOME) or snap.confirm_dialog.value:
         return False
     # 失败退避（修复：旧代码记录的是进入函数时的时间戳，内部循环十几秒后已过期，
     # 导致冷却形同虚设、不停重试按C；这里失败时在返回前取当前时间，见下方）
@@ -935,7 +937,7 @@ def _go_home_action(det, state, sess):
         print("  [Action] 没等到遇境画面，不退步（防 s 变打字）")
 
 
-def _friend_tree_action(det, sess, act):
+def _friend_tree_action(det, sess, state, act):
     """好友树互动动作（如抱抱）：检测入口图标 → 按F开好友树 → 方向键导航 → 空格发起 → ESC收起。
     导航序列来自 FRIEND_TREE_NAV，按动作名配置。返回是否成功发起。
 
@@ -1058,6 +1060,12 @@ def _friend_tree_action(det, sess, act):
     finally:
         _friend_tree_busy = False
         _friend_tree_last_time = time.time()
+        # 发起好友树互动（抱抱等）会让光崽站起来，姿势重置为 standing（真机实测）
+        with state.lock:
+            if state.pose_state != 'standing':
+                print(f"  [Action] {act} 后光崽站起来，姿势重置为 standing")
+                state.pose_state = 'standing'
+                state.pose_update_time = time.time()
 
 
 ACT_KEYS = {
@@ -1071,6 +1079,43 @@ ACT_KEYS = {
 # 光遇坐下表情循环：站(0) -> 蹲(1) -> 坐(2) -> 躺(3) -> 站(0)
 POSE_STATES = {'standing': 0, 'crouching': 1, 'sitting': 2, 'lying': 3}
 POSE_ACTIONS = {'蹲下': 'crouching', '坐下': 'sitting', '躺下': 'lying'}
+
+
+def _do_pose_action(det, sess, state, target_pose, current_pose=None, label=""):
+    """执行姿势切换：从 current_pose（默认读 state.pose_state）按动作键 3 到 target_pose。
+    按键间隔加长（0.7s），避免掉帧丢键导致少按一档（想躺只坐）。返回最终姿势。"""
+    with state.lock:
+        if current_pose is None:
+            current_pose = state.pose_state
+        state.pose_last_target = target_pose
+    current_idx = POSE_STATES.get(current_pose, 0)
+    target_idx = POSE_STATES.get(target_pose, 0)
+    # 计算需要按几次3（4次一个循环：站->蹲->坐->躺->站）
+    press_count = (target_idx - current_idx + 4) % 4
+    if press_count == 0:
+        print(f"  [Action] {label or target_pose} -> 已经是{target_pose}，跳过")
+        with state.lock:
+            state.pose_state = target_pose
+        return target_pose
+    if not _close_panel(det, sess):
+        print(f"  [Action] 面板可能还开着，{label or target_pose} 是游戏键，照做")
+    print(f"  [Action] {label or target_pose} -> 当前{current_pose}，目标{target_pose}，按{press_count}次3")
+    for i in range(press_count):
+        _key(sess, "3", 80)
+        time.sleep(0.7)
+    final_pose = target_pose
+    if VISION_POSE_CHECK and _vision.available:
+        final_pose = _verify_pose_with_vision(det, sess, target_pose)
+    with state.lock:
+        state.pose_state = final_pose
+        state.pose_update_time = time.time()
+        state.pose_need_retry = False
+        # 光遇中坐下/蹲下/躺下会自动断开牵手，同步重置牵手状态
+        if state.is_holding_hands:
+            print(f"  [Action] 姿势动作{label or target_pose}会断开牵手，重置牵手状态")
+            state.is_holding_hands = False
+    print(f"  [Action] 姿势状态更新为: {final_pose}")
+    return final_pose
 
 # 好友树互动动作：动作名 -> 打开好友树后的方向键导航序列（按动作名可配置，便于以后加击掌等）
 FRIEND_TREE_NAV = {
@@ -1237,38 +1282,12 @@ def _execute_reply(det, state, sess, reply):
             continue
         # 好友树互动动作（抱抱等）：检测入口图标→F→导航→空格→ESC
         if act in FRIEND_TREE_NAV:
-            _friend_tree_action(det, sess, act)
+            _friend_tree_action(det, sess, state, act)
             continue
         # 姿势动作：智能切换，根据当前状态计算需要按几次3
         if act in POSE_ACTIONS:
             target_pose = POSE_ACTIONS[act]
-            with state.lock:
-                current_pose = state.pose_state
-            current_idx = POSE_STATES.get(current_pose, 0)
-            target_idx = POSE_STATES.get(target_pose, 0)
-            # 计算需要按几次3（4次一个循环：站->蹲->坐->躺->站）
-            press_count = (target_idx - current_idx + 4) % 4
-            if press_count == 0:
-                print(f"  [Action] {act} -> 已经是{target_pose}，跳过")
-                continue
-            if not _close_panel(det, sess):
-                print(f"  [Action] 面板可能还开着，{act} 是游戏键，照做")
-            print(f"  [Action] {act} -> 当前{current_pose}，目标{target_pose}，按{press_count}次3")
-            for i in range(press_count):
-                _key(sess, "3", 80)
-                time.sleep(0.55)
-            final_pose = target_pose
-            if VISION_POSE_CHECK and _vision.available:
-                final_pose = _verify_pose_with_vision(det, sess, target_pose)
-            with state.lock:
-                state.pose_state = final_pose
-                state.pose_update_time = time.time()
-                state.pose_need_retry = False
-                # 光遇中坐下/蹲下/躺下会自动断开牵手，同步重置牵手状态
-                if state.is_holding_hands:
-                    print(f"  [Action] 姿势动作{act}会断开牵手，重置牵手状态")
-                    state.is_holding_hands = False
-            print(f"  [Action] 姿势状态更新为: {final_pose}")
+            _do_pose_action(det, sess, state, target_pose, label=act)
             continue
 
         k = ACT_KEYS.get(act)
@@ -2005,6 +2024,13 @@ def watch_loop(det: PanelDetector, state: SharedState,
                         _key(sess, "f", 120)
                         # 只按一次，不连续按（避免打开好友树）
                         time.sleep(1.0)
+                        # 牵手前按 C 关了面板，牵住后主动开回来（守门在 HOME 兜底受限，见 _open_panel）
+                        time.sleep(0.4)
+                        if panel_open(det) is not True:
+                            _key(sess, "c", 220)
+                            if not wait_panel(det, True, 2.0) and panel_open(det) is not True:
+                                time.sleep(0.5)
+                                _key(sess, "c", 220)
                     except Exception as e:
                         print(f"  [Watch] 牵手异常: {e}")
 
@@ -2230,21 +2256,51 @@ def _do_chat_ocr(det, state, ocr_engine, ai_q, voter=None):
     if not msgs:
         return
 
-    # 检测玩家说动作没成功，重置姿势状态
+    # 检测玩家说姿势没到位：把 pose_state 修正为玩家暗示的"实际姿势"，
+    # 这样 AI 重新输出动作时，Action 能算出正确的补按次数。
+    # 关键：必须是第二人称反馈（"你还坐着/你怎么还躺着"），要排除
+    # "我们还是坐着吧"这种指令/提议（主语"我们"、句尾"吧"），否则会把
+    # 指令误判成"实际已经是该姿势"，导致后续动作 press_count=0 被跳过。
     all_text = " ".join(msgs)
-    pose_retry_keywords = {
-        '坐下': ['没坐下', '你没有坐下', '你还站着', '怎么还站着', '没坐上', '你没坐下'],
-        '蹲下': ['没蹲下', '你没有蹲下', '你没蹲下'],
-        '躺下': ['没躺下', '你没有躺下', '你没躺下', '没躺上'],
-    }
-    for pose, keywords in pose_retry_keywords.items():
-        if any(kw in all_text for kw in keywords):
-            with state.lock:
-                if state.pose_state != 'standing':
-                    print(f"  [OCR] 玩家说{pose}没成功，重置姿势状态")
-                    state.pose_state = 'standing'
-                    state.pose_need_retry = True
-            break
+    # "我们…吧"是提议，不当反馈
+    is_suggestion = ('我们' in all_text and '吧' in all_text)
+    # 玩家描述实际姿势（第二人称"你还X着"）
+    actual_hint = None
+    second_person_patterns = [
+        ('sitting', ['你还坐着', '你还是坐着', '你怎么还坐着', '你只是坐着', '你只坐着']),
+        ('crouching', ['你还蹲着', '你还是蹲着', '你怎么还蹲着']),
+        ('standing', ['你还站着', '你还是站着', '你怎么还站着']),
+        ('lying', ['你还躺着', '你还是躺着', '你怎么还躺着']),
+    ]
+    if not is_suggestion:
+        for pose, words in second_person_patterns:
+            if any(w in all_text for w in words):
+                actual_hint = pose
+                break
+    # 明确的"没成功"词（没说实际姿势，保守重置为 standing）
+    explicit_fail = False
+    if not is_suggestion:
+        explicit_fail = any(w in all_text for w in [
+            '没坐下', '没蹲下', '没躺下', '没躺上', '没坐上',
+            '没有坐下', '没有蹲下', '没有躺下',
+            '你没坐下', '你没蹲下', '你没躺下', '怎么还站着'])
+    with state.lock:
+        last_target = state.pose_last_target
+        if actual_hint is not None:
+            # 目标与实际不一致就需要补按（前进/后退都算）：
+            # 目标 lying 实际 sitting、或目标 sitting 实际 lying 都要补；
+            # 目标 sitting 实际 sitting 说明已到位，不补。
+            need = POSE_STATES.get(last_target, 0) != POSE_STATES.get(actual_hint, 0)
+            if need:
+                if state.pose_state != actual_hint:
+                    print(f"  [OCR] 玩家说实际是{actual_hint}（目标{last_target}），修正姿势、待补按")
+                    state.pose_state = actual_hint
+                state.pose_need_retry = True
+        elif explicit_fail:
+            if state.pose_state != 'standing':
+                print(f"  [OCR] 玩家说姿势没成功，重置为 standing")
+                state.pose_state = 'standing'
+            state.pose_need_retry = True
 
     with state.lock:
         cur_latest = ""
@@ -2370,7 +2426,18 @@ def ai_loop(state: SharedState, ai_q: queue.Queue,
             # 姿势状态注入
             pose_names = {'standing': '站着', 'crouching': '蹲着', 'sitting': '坐着', 'lying': '躺着'}
             pose_name = pose_names.get(pose, '站着')
-            if pose != 'standing':
+            pose_action_names = {v: k for k, v in POSE_ACTIONS.items()}  # lying->躺下
+            with state.lock:
+                need_retry = state.pose_need_retry
+                last_target = state.pose_last_target
+            if need_retry and last_target:
+                target_name = pose_names.get(last_target, last_target)
+                target_act = pose_action_names.get(last_target, last_target)
+                system_with_memory += (
+                    f"\n\n## 姿势需要重试（重要，本次必须输出动作）\n你刚才想{target_name}但没到位，"
+                    f"玩家反馈你现在实际是{pose_name}。本次回复**必须**重新输出 [ACT]{target_act}[/ACT] "
+                    f"标签（程序会自动补按差额），不要只在嘴上说'再试一次'却不输出动作标签。")
+            elif pose != 'standing':
                 system_with_memory += f"\n\n## 当前姿势\n你现在正{pose_name}。聊天时可以自然地提到你的姿势。如果玩家说'你没有{pose_name[:-1]}诶''你还站着'之类的话，说明动作没成功，你应该重新执行对应的姿势动作。"
 
             # 回遇境完成状态注入
