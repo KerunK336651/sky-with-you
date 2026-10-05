@@ -138,7 +138,7 @@ class DetectorConfig:
     chat_band_bright: float = 0.001   # 条带内亮点（铅笔图标/占位文字）佐证（降低阈值更敏感）
     # 输入框肚子基本是空的（夜 0.003 / 亮主题 0.020），消息气泡塞满白字（0.029-0.073）。
     # 面板关着时别人的悬浮消息气泡会伪装成输入框——靠这条区分（2026-07-02 实测）
-    # ⚠ 亮箱 0.020 与气泡 0.029 之间余量不大，待实拍悬浮气泡样本后复核
+    # 注意：亮箱 0.020 与气泡 0.029 之间余量不大，待实拍悬浮气泡样本后复核
     chat_band_text: float = 0.025     # 条带内亮点超过此值 = 气泡/打字中，不表态
     chat_glow_veto: float = 0.35      # 判关时条带白光占比超过此值 = 疑似火光晃瞎
                                       # （实测：正常关 0.000，举火 0.709~1.000）
@@ -338,7 +338,7 @@ class WorldSnapshot:
                          ("confirm", self.confirm_dialog),
                          ("f", self.f_prompt)):
             if ch.value:
-                parts.append(f"{name}✓({ch.source} {ch.confidence:.2f})")
+                parts.append(f"{name}√({ch.source} {ch.confidence:.2f})")
         if self.confirm_dialog.value and self.confirm_keywords:
             parts.append("kw=" + "/".join(self.confirm_keywords))
         return " ".join(parts)
@@ -1086,7 +1086,7 @@ class PanelDetector:
         # 好友树已打开：主判据是右上角"人形+齿轮"逐帧模板（templates/friend_tree，离线
         # 0.998、非树帧<0.61，见续35/续37）。这里只保留极难误判的">=2 专属关键词"作弱兜底。
         # 续33 的底部提示行 OCR 判据 judge_friend_tree_menu 已停用：真机 2026-09-09 在根本
-        # 没开好友树（聊天面板开着、没按F）的切换帧被 OCR 瞬时误识成 tree✓(ocr:menu)，会诱发
+        # 没开好友树（聊天面板开着、没按F）的切换帧被 OCR 瞬时误识成 tree√(ocr:menu)，会诱发
         # watch 误按 ESC（甚至弹设置）；静态聊天帧虽不复现，但 OCR 异步+切换帧不可控，而模板
         # 在同一误判帧正确地没有触发——故好友树只信模板。纯函数 judge_* 与单测保留备用。
         tree_hits = tuple(k for k in FRIEND_TREE_KWS if k in joined)

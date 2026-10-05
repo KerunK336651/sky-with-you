@@ -52,3 +52,7 @@ ocr_real_shots/*
 !ocr_real_shots/放图说明.txt
 panel_close_debug/
 friend_tree_debug/
+
+# ── 临时克隆与根目录下划线开头的调试脚本（本地保留，不入库）──
+_tmp/
+/_*.py

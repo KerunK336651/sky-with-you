@@ -60,6 +60,13 @@ from core.reply_engine import (
 from core.style_learner import learn_style, style_prompt_key
 from core.vision_client import VisionClient, pose_press_delta
 
+# 本地知识库（可选；缺失时不影响主流程）
+try:
+    import knowledge
+except Exception as _kb_imp_err:
+    knowledge = None
+    print("  [Knowledge] 模块不可用: %s" % _kb_imp_err)
+
 # 输出编码跟随系统默认（Windows GBK），避免 cmd 下乱码
 # 如需 UTF-8 输出，设置环境变量 PYTHONIOENCODING=utf-8 并 chcp 65001
 
@@ -86,7 +93,7 @@ API_KEY       = _load_api_key()
 LLM_PROVIDER  = os.environ.get("SKY_LLM_PROVIDER", "openrouter").lower().strip()
 if LLM_PROVIDER == "deepseek":
     DEFAULT_BASE_URL = "https://api.deepseek.com"
-    DEFAULT_MODEL = "deepseek-v4-pro"
+    DEFAULT_MODEL = "deepseek-flash"
 else:
     DEFAULT_BASE_URL = "https://openrouter.ai/api/v1"
     DEFAULT_MODEL = "anthropic/claude-sonnet-4.5"
@@ -170,6 +177,10 @@ TEMPLATE_HAND_ENABLED = os.environ.get("SKY_TEMPLATE_HAND_ENABLED", "0") != "0"
 # SKY_MEM_READER=1 启用, =0 关闭（默认关闭，使用OCR）
 # 启用后跳过OCR聊天识别，直接从游戏内存读取聊天消息
 MEM_READER_ENABLED = os.environ.get("SKY_MEM_READER", "0") == "1"
+
+# 自动接传送/确认弹窗（好友传送过来时自动按空格接受）
+# SKY_ACCEPT_TELEPORT=1 启用, =0 关闭（默认关闭：自动接弹窗会误触聊天面板，先手动接）
+ACCEPT_TELEPORT_ENABLED = os.environ.get("SKY_ACCEPT_TELEPORT", "0") == "1"
 
 # 全局 YOLO 模型和状态
 _yolo_model = None
@@ -482,61 +493,52 @@ def _close_panel(det, sess) -> bool:
     return _check_closed()
 
 
-def _pose_area_has_other(frame):
-    """姿势视觉校验前的本地安全闸：在角色裁剪区做一次轻量 OCR，若出现白名单其他
-    玩家的名字标签，说明旁边站着人，VLM 可能把别人当成自己（实测会选成站着的他人）；
-    此时调用方跳过视觉校验、回退盲信，绝不因认错人而乱补按。"""
-    if frame is None or _vision is None:
-        return False
-    c = getattr(_vision, "pose_crop", None) or (0.20, 0.35, 0.90, 1.0)
-    h, w = frame.shape[:2]
-    x0, y0, x1, y1 = int(w*c[0]), int(h*c[1]), int(w*c[2]), int(h*c[3])
-    crop = frame[max(0, y0):y1, max(0, x0):x1]
-    if crop.size == 0:
-        return False
-    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-    res, _ = _get_name_ocr_engine()(gray)
-    text = " ".join(str(r[1]) for r in (res or []))
-    if text.strip() and DEBUG:
-        print("  [Vision] 角色区OCR文字:", text[:60])
-    return is_whitelist_player_name(text)
-
-
-def _verify_pose_with_vision(det, sess, target_pose, max_round=2, settle=1.4):
-    """按完姿势键后用 VLM 看一眼实际姿势，没到目标则【每次只补1下】再看，最多 max_round 轮。
-    关键保护：补按后若到目标的循环距离没有变小（VLM抖动/动画未落定），立即停止，
-    绝不一补补好几下导致姿势绕一圈又站回去。VLM 不可用/看不清/异常时回退‘盲信目标’。"""
-    def _observe():
-        time.sleep(settle)  # 等姿势切换动画彻底落定，避免看到中间帧
+def _verify_pose_with_vision(det, sess, target_pose, max_round=2, settle=1.2):
+    """按完姿势键后用【完整帧 VLM】看一眼实际姿势。
+    核心防误补按：每次都观察两次（中间隔 0.4s），只有两次都 sure 且结果一致，
+    才采信这个姿势——单次误判/认错人/动画中间帧都不会触发补按。
+      · 两次一致且到目标 -> 成功；
+      · 两次不一致或有 sure=false -> 看不清，回退盲信目标，绝不乱补；
+      · 两次一致但都没到目标 -> 补按1次3，再看；补按后距离没变小就停，防绕圈站起。"""
+    def _observe(wait):
+        if wait:
+            time.sleep(wait)  # 等姿势动画落定，避免看到中间帧
         frame = det.latest_frame()
-        try:
-            if _pose_area_has_other(frame):
-                print("  [Vision] 旁边检测到其他玩家，VLM 可能认错人，跳过本次校验回退")
-                return None
-        except Exception as _e:
-            print(f"  [Vision] 他人检测异常(继续校验): {_e}")
-        pose, sure = _vision.classify_pose(frame)
-        print(f"  [Vision] 姿势校验: 目标={target_pose} 实测={pose} sure={sure}")
+        pose, sure = _vision.classify_pose(frame)  # 完整帧，能看到头顶名字区分自己/别人
         return pose if sure else None
-    observed = _observe()
-    if observed == target_pose:
+
+    p1 = _observe(settle)
+    p2 = _observe(0.4)
+    print(f"  [Vision] 姿势校验: 目标={target_pose} 观察=({p1},{p2})")
+    if p1 == target_pose and p2 == target_pose:
         return target_pose
+    if p1 is None or p2 is None or p1 != p2:
+        print("  [Vision] 两次观察不一致/不确定，回退盲信目标")
+        return target_pose
+
+    observed = p1
     for _ in range(max_round):
-        if observed is None or observed not in POSE_STATES:
+        if observed not in POSE_STATES:
             break
         dist = pose_press_delta(POSE_STATES[observed], POSE_STATES[target_pose])
         if dist == 0:
             break
-        print(f"  [Vision] 实测{observed}未到{target_pose}（差{dist}），保守补按1次3")
+        print(f"  [Vision] 两次确认{observed}未到{target_pose}（差{dist}），补按1次3")
         _key(sess, "3", 80)
         time.sleep(0.55)
-        prev_dist, observed = dist, _observe()
-        if observed in POSE_STATES and observed != target_pose:
-            new_dist = pose_press_delta(POSE_STATES[observed], POSE_STATES[target_pose])
-            if new_dist >= prev_dist:
-                print("  [Vision] 补按后未更接近目标，停止补按以防绕圈站起")
-                break
-    return observed if observed in POSE_STATES else target_pose
+        n1 = _observe(settle)
+        n2 = _observe(0.4)
+        if n1 is None or n2 is None or n1 != n2:
+            print("  [Vision] 补按后观察不一致，停止并回退盲信")
+            return target_pose
+        new_dist = pose_press_delta(POSE_STATES[n1], POSE_STATES[target_pose])
+        if n1 == target_pose:
+            return target_pose
+        if new_dist >= dist:
+            print("  [Vision] 补按后未更接近目标，停止补按以防绕圈站起")
+            return target_pose
+        observed = n1
+    return target_pose
 
 
 def _select_closed(use_yolo, yolo_closed, panel_val):
@@ -889,7 +891,7 @@ def _confirm_action(det, state, sess):
     # 立即设置标志，阻止其他逻辑干扰
     _confirm_in_progress = True
     _confirm_lock_time = time.time()
-    # 策略：默认选中的是确认（✓），直接按空格，不按方向键
+    # 策略：默认选中的是确认（√），直接按空格，不按方向键
     time.sleep(0.5)
     print("  [Action] 按空格确认（默认确认）")
     _key(sess, "space", 100)
@@ -1244,9 +1246,26 @@ def ensure_chat_wrapped(reply):
     return reply
 
 
+# ACT 标签的统一定义：发送层/动作分发/回遇境判定都从这里取，避免各写各的正则。
+# 标签内允许空白（模型常输出 '[ACT] 回遇境 [/ACT]'），所以一律 group(1).strip() 后再比动作名。
+_ACT_TAG_RE = re.compile(r'\[ACT\](.*?)\[/ACT\]', re.DOTALL)
+
+
+def extract_act_names(reply):
+    """提取回复里所有 [ACT]..[/ACT] 的动作名（已 strip 掉标签内空白）。
+
+    没有 ACT 标签/回复为空时返回 []。历史上回遇境的判定用的是精确串
+    `'[ACT]回遇境[/ACT]' in reply`，模型一旦多打空格就漏判、导致"先发消息再回遇境"
+    绕过了保护（2026-10-05 修复），所以统一走这个函数。
+    """
+    if not reply:
+        return []
+    return [m.group(1).strip() for m in _ACT_TAG_RE.finditer(reply)]
+
+
 def _execute_reply(det, state, sess, reply):
     # 先检查是否有回遇境动作，如果有就先执行动作，跳过消息发送
-    has_gohome = '[ACT]回遇境[/ACT]' in reply
+    has_gohome = '回遇境' in extract_act_names(reply)
     if has_gohome:
         print("  [Action] 检测到回遇境动作，跳过消息发送，先执行动作")
     else:
@@ -1258,8 +1277,7 @@ def _execute_reply(det, state, sess, reply):
                     state.sent_history.append((msg, time.time()))
             time.sleep(1.0)  # 发送完消息后延迟1秒再执行后续操作
 
-    for m in re.finditer(r'\[ACT\](.*?)\[/ACT\]', reply, re.DOTALL):
-        act = m.group(1).strip()
+    for act in extract_act_names(reply):
         if act == '回家牵手':
             if det.world.snapshot().screen == Screen.HOME:
                 print("  [Action] 已经在遇境了，跳过回家")
@@ -1888,7 +1906,7 @@ def watch_loop(det: PanelDetector, state: SharedState,
             with state.lock:
                 busy = state.action_busy
                 last_confirm = state.last_confirm_time
-            if snap.confirm_dialog.value and not busy \
+            if ACCEPT_TELEPORT_ENABLED and snap.confirm_dialog.value and not busy \
                     and not _confirm_in_progress \
                     and not _sending_msg \
                     and t0 - last_confirm > CONFIRM_COOLDOWN:
@@ -2334,7 +2352,7 @@ def _do_chat_ocr(det, state, ocr_engine, ai_q, voter=None):
 
 # ===================== AiThread（重写：集成记忆/搜索/风格/防重复/打磨） =====================
 
-def ai_loop(state: SharedState, ai_q: queue.Queue,
+def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             action_q: queue.Queue, llm_client: LLMClient):
     print("  [AI] 线程启动（sky-companion 聊天引擎）")
 
@@ -2416,6 +2434,22 @@ def ai_loop(state: SharedState, ai_q: queue.Queue,
             if learned_search:
                 system_with_memory += "\n\n## 已学到的联网知识\n" + learned_search
 
+            # ── 本地知识库：游戏常识（纯本地、零风险） ──
+            if knowledge is not None:
+                try:
+                    kb_snippets = knowledge.query(player_msg)
+                    if kb_snippets:
+                        system_with_memory += (
+                            "\n\n## 游戏常识（与当前话题相关，可作为背景）\n"
+                            + "\n".join(kb_snippets))
+                    core_notes = knowledge.core_notes()
+                    if core_notes:
+                        system_with_memory += (
+                            "\n\n## 操作约定（务必遵守）\n"
+                            + "\n".join("· " + n for n in core_notes))
+                except Exception as _kb_err:
+                    print("  [Knowledge] 注入失败: %s" % _kb_err)
+
             # 牵手状态注入
             with state.lock:
                 holding = state.is_holding_hands
@@ -2446,6 +2480,9 @@ def ai_loop(state: SharedState, ai_q: queue.Queue,
             if gohome_done:
                 system_with_memory += "\n\n## 刚刚发生的事\n你刚刚成功执行了回遇境，现在已经在遇境了。请自然地提到这件事（比如'终于回来了''到遇境啦'），不要太刻意。"
 
+            # 视觉不再做“固定触发词预识别”：改为在第7步注册 look_at_screen 工具，
+            # 由模型自己判断何时看画面（场景/姿势/前方物体/图标都能问）。
+
             # ── 6. 组装用户消息内容 ──
             content = "\n".join(msgs[-10:])
             if priority:
@@ -2470,7 +2507,6 @@ def ai_loop(state: SharedState, ai_q: queue.Queue,
                     + list(state.conversation)
                 )
 
-            # ── 7. 调用 LLM ──
             if AI_TRACE_ENABLED:
                 _ai_trace_write(
                     "\n" + "=" * 72 +
@@ -2479,12 +2515,88 @@ def ai_loop(state: SharedState, ai_q: queue.Queue,
                     % (time.strftime("%H:%M:%S"), player_msg, bool(priority),
                        bool(search_context), len(conv_snapshot),
                        _fmt_messages_for_trace(conv_snapshot)))
-            _t_llm = time.time()
-            reply = llm_client.chat(
-                messages=conv_snapshot,
-                temperature=0.7,
-                max_tokens=300,
+
+            # ── 7. 调用 LLM（注册视觉工具，让模型自己决定何时看画面）──
+            _vision_ok = (_vision is not None and _vision.available)
+            LOOK_SCREEN_TOOL = [{
+                "type": "function",
+                "function": {
+                    "name": "look_at_screen",
+                    "description": "看一眼当前游戏画面。当玩家问你看到了什么、在做什么动作、"
+                                   "前面有什么、这是哪里、有没有坐下/躺下/牵手，或你需要确认当前"
+                                   "画面、场景、姿势、图标时，就调用这个工具。问场景时要开放，"
+                                   "不要把答案限定在你猜的两个地图里（否则会认错）。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "question": {
+                                "type": "string",
+                                "description": "你想从画面里确认的具体问题，例如‘我们前面有什么’"
+                                               "‘玩家现在是什么姿势’‘这是哪个地图’‘有没有牵手’"
+                            }
+                        },
+                        "required": ["question"]
+                    }
+                }
+            }]
+            # 场景类问题统一用这个【开放、列全地图】的 prompt，避免模型把问题写成
+            # “遇境还是云野”这种二选一预设、把正确答案（如霞谷）直接排除（2026-10-05 真机根因）
+            SCENE_STD_QUESTION = (
+                "这是游戏《光·遇》的画面。请客观判断当前最可能是哪个地图/场景，"
+                "从这些里选但不限于：遇境、云野、雨林、霞谷、暮土、禁阁、圣岛、小王子季等，"
+                "能具体到具体地点更好。"
+                "区分特征：霞谷=冰雪覆盖、滑行赛道、圆梦村/竞技场、尖顶城堡；"
+                "云野=绿色草地、蝴蝶、浮岛、圆顶神殿；雨林=下雨、高大树木、发光蘑菇；"
+                "暮土=荒漠、冥龙、黑色废墟；禁阁=高塔、多层书阁；遇境=环形石门加中央星盘。"
+                "用一两句话说明判断依据（地形、建筑、光线、冰雪、植被等）。只说结论和依据，"
+                "不要被任何先入猜测影响，画面和猜测矛盾时以画面为准。"
             )
+            _t_llm = time.time()
+            work_messages = list(conv_snapshot)
+            msg = llm_client.chat_raw(
+                work_messages, temperature=0.7, max_tokens=300,
+                tools=LOOK_SCREEN_TOOL if _vision_ok else None)
+            _tool_rounds = 0
+            while msg.get("tool_calls") and _tool_rounds < 2 and _vision_ok:
+                work_messages.append({
+                    "role": "assistant",
+                    "content": msg.get("content"),
+                    "tool_calls": msg["tool_calls"]})
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {}) or {}
+                    tname = fn.get("name", "")
+                    tid = tc.get("id", "")
+                    if tname == "look_at_screen":
+                        try:
+                            _args = json.loads(fn.get("arguments") or "{}")
+                            _q = _args.get("question") or "描述一下当前画面"
+                        except Exception:
+                            _q = "描述一下当前画面"
+                        _frame = det.latest_frame()
+                        print(f"  [Vision] 模型主动看画面: {_q}")
+                        if _frame is not None:
+                            # 场景类问题改用标准开放 prompt，避免模型“二选一”预设带偏
+                            if any(k in _q for k in
+                                   ("哪里", "哪儿", "什么地方", "场景", "地图", "在哪", "地方")):
+                                _use_q = SCENE_STD_QUESTION
+                                print("  [Vision] 场景类问题，使用标准开放 prompt")
+                            else:
+                                _use_q = _q
+                            _r = _vision.ask(_frame, _use_q, max_tokens=200, temperature=0.1)
+                        else:
+                            _r = "（截图失败，无法查看）"
+                        work_messages.append({
+                            "role": "tool", "tool_call_id": tid,
+                            "content": _r or "（没看清画面）"})
+                    else:
+                        work_messages.append({
+                            "role": "tool", "tool_call_id": tid,
+                            "content": "（未知工具）"})
+                _tool_rounds += 1
+                msg = llm_client.chat_raw(
+                    work_messages, temperature=0.7, max_tokens=300,
+                    tools=LOOK_SCREEN_TOOL)
+            reply = msg.get("content") or ""
             _llm_dt = time.time() - _t_llm
             print(f'  [AI] LLM耗时 {_llm_dt:.1f}s')
             if AI_TRACE_ENABLED:
@@ -2974,7 +3086,7 @@ def main():
     threads = [
         threading.Thread(target=watch_loop, args=(det, state, ocr_q, action_q),
                          name="Watch", daemon=True),
-        threading.Thread(target=ai_loop, args=(state, ai_q, action_q, llm_client),
+        threading.Thread(target=ai_loop, args=(det, state, ai_q, action_q, llm_client),
                          name="AI", daemon=True),
         threading.Thread(target=action_loop, args=(det, state, action_q),
                          name="Action", daemon=True),

@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """验证 confirm 误判修复：聊天内容里的"接受/加入"等词，在无弹窗视觉特征时不应触发自动空格。"""
+import sys
+
 from panel_detector import PanelDetector, Screen
 
 
@@ -51,3 +53,5 @@ print(f"场景4 全屏OCR含'加入'但无视觉特征: confirm={r4}（期望 Fa
 
 ok = (r1 is False and r2 is True and r3 is True and r4 is False)
 print("\n结果:", "全部通过" if ok else "有失败，需检查")
+# 必须带退出码：只打印结论的话，失败也会 exit 0，批量跑测试时会把它误判成通过
+sys.exit(0 if ok else 1)

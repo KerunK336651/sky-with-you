@@ -21,13 +21,13 @@ echo ========================================
 echo   Sky With You 一键启动（选择模式）
 echo ========================================
 echo.
-echo   [1] 正常启动：硬件MCP + 主循环（OCR识别/Arduino按键）   默认
+echo   [1] 正常启动：deepseek-flash 一个模型全包（聊天+视觉，OCR/Arduino）   默认
 echo   [2] 正常启动 + AI对话转储（logs\ai_trace，排查AI输入输出）
 echo   [3] 内存读取模式：硬件MCP + mem主循环（需管理员）
 echo   [4] 只启动 MCP 服务器（主循环想自己手动开时用）
 echo   [5] 无硬件演示模式（软件按键，光遇可能屏蔽，仅调试）
-echo   [6] 视觉校验模式：硬件MCP+主循环+VLM姿势校验（千问，耗少量token）
-echo   [7] 视觉校验 + AI对话转储（姿势校验 + logs\ai_trace）
+echo   [6] （同[1]，视觉已并入正常模式）deepseek-flash 视觉校验
+echo   [7] （同[2]）视觉校验 + AI对话转储
 echo   [0] 退出
 echo.
 set "choice="

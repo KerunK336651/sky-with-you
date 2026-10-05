@@ -11,7 +11,9 @@ echo ========================================
 echo.
 
 set SKY_LLM_PROVIDER=deepseek
-set SKY_LLM_MODEL=deepseek-v4-flash
+set SKY_LLM_MODEL=deepseek-flash
+set SKY_VISION_ENABLED=1
+set SKY_VISION_PROVIDER=deepseek
 set SKY_INPUT_BACKEND=arduino
 set SKY_SEARCH_ENABLED=1
 set SKY_WHITELIST_ENABLED=1

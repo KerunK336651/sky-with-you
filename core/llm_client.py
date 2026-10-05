@@ -54,16 +54,23 @@ class LLMClient:
         Returns:
             str: the assistant's reply text.
         """
+        msg = self.chat_raw(messages, temperature=temperature, max_tokens=max_tokens)
+        return msg.get("content") or ""
+
+    def chat_raw(self, messages, temperature=0.7, max_tokens=300, tools=None):
+        """Like chat(), but returns the raw assistant message dict
+        (OpenAI shape: {"role","content","tool_calls",...}). Pass tools to
+        enable function calling."""
         if isinstance(messages, str):
             messages = [{"role": "user", "content": messages}]
 
         if self.provider == "deepseek" and self._use_direct_http():
-            return self._chat_http(messages, temperature, max_tokens)
-        return self._chat_sdk(messages, temperature, max_tokens)
+            return self._chat_http_raw(messages, temperature, max_tokens, tools)
+        return self._chat_sdk_raw(messages, temperature, max_tokens, tools)
 
     # ── OpenAI SDK path (openrouter / generic) ───────────────────────
 
-    def _chat_sdk(self, messages, temperature, max_tokens):
+    def _chat_sdk_raw(self, messages, temperature, max_tokens, tools=None):
         if self._sdk_client is None:
             raise RuntimeError("OpenAI SDK not available or API key not set for provider=" + self.provider)
         kwargs = {
@@ -75,6 +82,8 @@ class LLMClient:
         extra = self._extra_body()
         if extra:
             kwargs["extra_body"] = extra
+        if tools:
+            kwargs["tools"] = tools
         try:
             resp = self._sdk_client.chat.completions.create(**kwargs)
             msg0 = resp.choices[0].message
@@ -82,7 +91,7 @@ class LLMClient:
                 self.last_raw_message = msg0.model_dump()
             except Exception:
                 self.last_raw_message = {"content": getattr(msg0, "content", None)}
-            return msg0.content or ""
+            return self.last_raw_message
         except Exception as e:
             raise RuntimeError(self._format_api_error(e))
 
@@ -92,7 +101,7 @@ class LLMClient:
         base = (self.base_url or "").lower()
         return "api.deepseek.com" in base or self.provider == "deepseek"
 
-    def _chat_http(self, messages, temperature, max_tokens):
+    def _chat_http_raw(self, messages, temperature, max_tokens, tools=None):
         url = self._chat_url()
         extra_body = self._extra_body()
         if extra_body and extra_body.get("thinking", {}).get("type") == "enabled":
@@ -105,6 +114,8 @@ class LLMClient:
         }
         if extra_body:
             payload.update(extra_body)
+        if tools:
+            payload["tools"] = tools
         headers = {
             "Authorization": "Bearer " + self.api_key,
             "Content-Type": "application/json",
@@ -116,10 +127,10 @@ class LLMClient:
             data = resp.json()
             choices = data.get("choices", [])
             if not choices:
-                return ""
+                return {"role": "assistant", "content": ""}
             msg = choices[0].get("message") or {}
             self.last_raw_message = msg  # 完整原始字段（若开 thinking 可能带 reasoning_content）
-            return msg.get("content") or ""
+            return msg
         except requests.RequestException as e:
             raise RuntimeError(f"HTTP request failed: {e}")
 

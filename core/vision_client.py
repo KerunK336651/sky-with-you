@@ -85,40 +85,65 @@ class VisionClient:
         if enabled is None:
             enabled = os.environ.get("SKY_VISION_ENABLED", "0") == "1"
         self.enabled = bool(enabled)
-        self.api_key = api_key or self._load_key()
+        # 视觉提供方：deepseek（复用 DeepSeek key，deepseek-flash 原生多模态）
+        # 或默认 qwen（阿里云百炼 qwen-vl-plus）。用 SKY_VISION_PROVIDER 切换。
+        self.provider = os.environ.get("SKY_VISION_PROVIDER", "qwen").lower().strip()
+        if self.provider == "deepseek":
+            default_base = "https://api.deepseek.com"
+            default_model = "deepseek-flash"
+        else:
+            default_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+            default_model = "qwen-vl-plus"
         self.base_url = (base_url or os.environ.get(
-            "SKY_VISION_BASE_URL",
-            "https://dashscope.aliyuncs.com/compatible-mode/v1")).rstrip("/")
-        self.model = model or os.environ.get("SKY_VISION_MODEL", "qwen-vl-plus")
+            "SKY_VISION_BASE_URL", default_base)).rstrip("/")
+        self.model = model or os.environ.get("SKY_VISION_MODEL", default_model)
+        self.api_key = api_key or self._load_key()
         self.timeout = float(timeout)
         self.max_width = int(max_width)
         self.jpeg_quality = int(jpeg_quality)
-        # 姿势判断只裁“自己角色”常出现的中下方区域再放大，避免全屏角色太小看错；
-        # 可用 SKY_VISION_POSE_CROP=x0,y0,x1,y1（比例）覆盖。
+        # 姿势判断默认用【完整帧】。实测（2026-10-05）：裁剪放大后，站在画面中央的
+        # 别人会强烈干扰模型，即使它“描述”时认对了，POSE_QUESTION 仍常把中央站着的
+        # 别人误当成自己、判错姿势；完整帧反而 6/6 稳定判对。如需裁剪，可用
+        # SKY_VISION_POSE_CROP=x0,y0,x1,y1（比例）覆盖。
         if pose_crop is None:
             env = os.environ.get("SKY_VISION_POSE_CROP", "").strip()
             if env:
                 try:
                     pose_crop = tuple(float(x) for x in env.split(","))
                 except Exception:
-                    pose_crop = (0.20, 0.35, 0.90, 1.0)
+                    pose_crop = None
             else:
-                pose_crop = (0.20, 0.35, 0.90, 1.0)
+                pose_crop = None
         self.pose_crop = pose_crop
         self.total_calls = 0
         self.total_fail = 0
 
     @staticmethod
-    def _load_key():
+    def _project_root():
+        return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def _load_key(self):
+        # 优先视觉专用 key
         k = os.environ.get("SKY_VISION_API_KEY", "")
         if k:
             return k.strip()
-        # 兼容：也允许复用文本模型 key
+        if self.provider == "deepseek":
+            # 复用 DeepSeek 主 key：环境变量或项目根目录 key.txt
+            k = (os.environ.get("DEEPSEEK_API_KEY", "")
+                 or os.environ.get("OPENROUTER_API_KEY", ""))
+            if k:
+                return k.strip()
+            p = os.path.join(self._project_root(), "key.txt")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    return f.read().strip()
+            except OSError:
+                return ""
+        # qwen：兼容复用文本 key，或读 vision_key.txt
         k = os.environ.get("OPENROUTER_API_KEY", "")
         if k:
             return k.strip()
-        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                         "vision_key.txt")
+        p = os.path.join(self._project_root(), "vision_key.txt")
         try:
             with open(p, "r", encoding="utf-8") as f:
                 return f.read().strip()
@@ -173,6 +198,9 @@ class VisionClient:
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        # DeepSeek flash 关闭思考，避免 token 全花在推理上、content 为空
+        if self.provider == "deepseek" or "deepseek" in self.base_url:
+            payload["thinking"] = {"type": "disabled"}
         headers = {"Authorization": "Bearer " + self.api_key,
                    "Content-Type": "application/json"}
         t0 = time.time()
@@ -207,14 +235,18 @@ class VisionClient:
 
     # ── 具体任务1：姿势校验 ──────────────────────────────────────────
     POSE_QUESTION = (
-        "这是游戏《光·遇》的画面（已裁出角色常出现的画面中下部，画面里可能同时有多个斗篷小人）。\n"
-        "先找到【你正在操作的自己的角色】：它最靠近画面水平正中央，且头顶【没有】中文名字标签；"
-        "头顶写着名字（例如珂珂/幺幺/阿颜）的是其他玩家，请完全忽略，不要把他们的姿势当答案。\n"
-        "只判断这个‘最靠近中央、头顶无名字’的自己角色当前的身体姿势，"
+        "这是游戏《光·遇》的画面（已裁出画面中下部，画面里可能同时有多个斗篷小人）。\n"
+        "【严格按下面的顺序判定，不要颠倒】：\n"
+        "1. 先逐个看小人头顶：头顶【有】中文名字标签（例如珂珂/幺幺/阿颜）的，100% 是其他玩家，"
+        "立刻把他们排除，绝不允许把他们的姿势当答案；\n"
+        "2. 你自己操作的角色，头顶【永远没有】任何名字标签。在头顶【完全没有名字】的小人里，"
+        "挑最靠近画面中央偏下的那个，那就是你自己（‘靠近中央’只是辅助，前提是它头顶确实没有名字）；\n"
+        "3. 只判断这个‘头顶无名字’的自己角色当前的身体姿势，"
         "只返回JSON、不要多余文字：\n"
         '{"pose": "standing或crouching或sitting或lying", "sure": true或false}\n'
-        "standing=站着, crouching=蹲着/屈膝, sitting=坐在地上/凳子, lying=躺下。"
-        "若中央角色被别人挡住、太小、正在移动导致模糊，或无法确定哪个是自己，就 sure=false。"
+        "standing=站着, crouching=蹲着/屈膝, sitting=坐在地上/凳子, lying=躺下。\n"
+        "若所有小人头顶都有名字、头顶无名字的小人有多个无法区分、或角色被挡住/移动模糊，"
+        "就 sure=false。"
     )
 
     def classify_pose(self, frame):
