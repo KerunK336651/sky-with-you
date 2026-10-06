@@ -1,6 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 视角锁定测试脚本 v6
+
+【2026-10-06 结论：本脚本的前提不成立，别再用它，也别再研究"方向键转视角"】
+本脚本原假设「光遇键位：方向键=查看，可以转视角」。用户真机确认这是错的：
+    方向键（不是 WASD）**不能控制视角**，只能做菜单导航
+    —— 例如打开好友树后，用方向键在互动动作列表里选择。
+因此"按住方向键转视角"这条路线整个不成立，脚本里的 OCR 找名字 + 按方向键居中
+那套逻辑跑起来不会有任何效果。
+相机转向目前只能靠鼠标（参考 SkyAuto 的做法：把角度换算成鼠标相对位移，
+config 里的 angle2MouseMoveByX；详见 PROJECT_HANDOFF.md 第二十九章）。
+本文件保留只为留痕，不要在此基础上继续开发。
+
+（下面这段是原说明，已作废）
 改用键盘方向键转视角（光遇键位：方向键=查看），不抢鼠标
 """
 import cv2
@@ -40,6 +52,12 @@ def press_key(vk, duration_ms=100):
 FindWindowW = ctypes.windll.user32.FindWindowW
 GetWindowRect = ctypes.windll.user32.GetWindowRect
 IsWindowVisible = ctypes.windll.user32.IsWindowVisible
+
+# 必须先声明 DPI 感知，否则量到的是逻辑像素（125%/150% 缩放下与 mss 的物理像素不符）。
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
 
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),

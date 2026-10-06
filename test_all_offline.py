@@ -41,6 +41,8 @@ SAFE = [
     "test_logic.py",            # 识别→解析→去重→过滤 纯函数
     "test_task_queue.py",       # task_queue 完整单测
     "test_doctor.py",           # doctor.py 检查逻辑
+    "test_ocr_engine.py",       # OCR 引擎装配：v3/v5 指纹 + DML/CPU 设备 + 三条回退路径
+    "test_window_fix.py",       # 窗口 1080p 对齐：尺寸反算/缩放比/参数解析（纯计算，不碰窗口）
     "test_ocr_enhance.py",      # OCR 增强（会跑真实 OCR，最慢，放最后）
 ]
 
@@ -49,7 +51,7 @@ SKIP = [
     ("test_arduino_loop.py", "会打开记事本+模拟按键+改剪贴板，必须人工在场"),
     ("test_arduino_key.py", "需要 Arduino 硬件在 COM 口上"),
     ("test_key.py", "会往游戏窗口按键，需要游戏在跑"),
-    ("test_view_lock.py", "截屏+按键转视角，需要游戏在跑"),
+    ("test_view_lock.py", "已作废（方向键不能转视角，前提不成立，见文件头）；且仍需游戏在跑"),
     ("test_memory.py", "需要管理员权限、读游戏内存、写结果文件"),
     ("test_chat_engine.py", "会真实调用 LLM（花钱）"),
     ("test_deepseek_vision.py", "会真实调用付费视觉 API"),

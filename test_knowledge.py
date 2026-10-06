@@ -53,10 +53,12 @@ for name in maps.get_all_maps():
     check("「%s」可回遇境（规则断言）" % name,
           "遇境" in maps.MAPS[name]["connected"])
 
-# 遇境石门只通向 6 张主图（不含暴风眼/伊甸/季节图）
-check("遇境石门只通向 6 张主图",
+# 遇境石门通向 6 张主图；另有「云巢门」通向云巢。
+# 2026-10-06 DSH 补：BWIKI 侧栏把云巢与遇境/晨岛/云野/雨林/霞谷/暮土/禁阁/伊甸并列，
+# SkyAuto maps.json 也把云巢记成独立大图（其 from 为「遇境的云巢门」），故云巢不是季节图。
+check("遇境石门通向 6 张主图 + 云巢门通向云巢",
       set(maps.MAPS["遇境"]["connected"]) ==
-      {"晨岛", "云野", "雨林", "霞谷", "暮土", "禁阁"})
+      {"晨岛", "云野", "雨林", "霞谷", "暮土", "禁阁", "云巢"})
 
 # 伊甸是唯一不可回遇境的地图（connected 为空）
 check("伊甸 connected 为空（献祭终点）", maps.MAPS["伊甸"]["connected"] == [])
@@ -67,6 +69,81 @@ for season, host in [("圣岛", "云野"), ("圆梦村", "霞谷"),
     check("季节图「%s」与「%s」双向" % (season, host),
           host in maps.MAPS[season]["connected"]
           and season in maps.MAPS[host]["connected"])
+
+# ── 云巢：独立大图（不是季节图）──
+check("云巢是常驻图（belongs_to 为 None）", maps.MAPS["云巢"]["belongs_to"] is None)
+check("云巢可回遇境", "遇境" in maps.MAPS["云巢"]["connected"])
+
+# ── areas：区域字段的 schema（聚合断言，新增地图自动覆盖）──
+ALL_AREAS = [(n, a) for n in maps.get_all_maps() for a in maps.get_areas(n)]
+check("每个区域都有非空 name 与 from（共 %d 个区域）" % len(ALL_AREAS),
+      all(a.get("name") and a.get("from") for _, a in ALL_AREAS))
+check("区域项不含随版本变动的数值字段（不收烛火量/光翼数）",
+      not any({"wax", "wing", "wings", "krill"} & set(a) for _, a in ALL_AREAS))
+check("区域名在本图内唯一",
+      all(len([a["name"] for a in maps.get_areas(n)])
+          == len({a["name"] for a in maps.get_areas(n)})
+          for n in maps.get_all_maps()))
+check("区域名跨图无重名（重名的会被区域索引丢弃）",
+      len({a["name"] for _, a in ALL_AREAS}) == len(ALL_AREAS))
+check("云巢有 6 个区域", len(maps.get_areas("云巢")) == 6)
+check("禁阁区域含织光阁",
+      any(a["name"] == "织光阁" for a in maps.get_areas("禁阁")))
+check("未收录 areas 的地图返回空列表", maps.get_areas("遇境") == [])
+check("不存在的地图 get_areas 返回空列表", maps.get_areas("不存在的地方") == [])
+check("晴空试炼类区域标了 no_fly",
+      all(a.get("no_fly") for a in maps.get_areas("晨岛")
+          if a["name"].endswith("之试炼")))
+
+# ── enter_from：季节图的入口 ──
+check("圣岛入口是云野·云顶浮石里侧云洞",
+      maps.get_enter_from("圣岛") == "云野·云顶浮石里侧云洞")
+check("未收录 enter_from 的地图返回空字符串", maps.get_enter_from("晨岛") == "")
+check("不存在的地图 get_enter_from 返回空字符串",
+      maps.get_enter_from("不存在的地方") == "")
+
+# ── 伊甸 / 暴风眼：两处此前会答错的归属 ──
+check("别名 伊甸之眼 指向伊甸（国服官方把整个伊甸叫「伊甸之眼」）",
+      maps._MAP_ALIASES.get("伊甸之眼") == "伊甸")
+check("query('伊甸之眼怎么去') 命中的是伊甸",
+      any("地图·伊甸" in s for s in knowledge.query("伊甸之眼怎么去")))
+check("别名 星光沙漠 指向星漠",
+      maps._MAP_ALIASES.get("星光沙漠") == "星漠")
+check("query('星光沙漠在哪') 命中星漠",
+      any("地图·星漠" in s for s in knowledge.query("星光沙漠在哪")))
+check("伊甸大门带 20 个光之翼门槛",
+      any(a["name"] == "伊甸大门" and "20" in a.get("barrier", "")
+          for a in maps.get_areas("暴风眼")))
+check("伊甸之眼标了禁飞且有石像/重置提示",
+      any(a["name"] == "伊甸之眼" and a.get("no_fly") and "63" in a.get("note", "")
+          for a in maps.get_areas("伊甸")))
+
+# ── 每日大蜡烛周轮换（来源见 maps.py 文件头，尚未实机核对）──
+check("大蜡烛表覆盖周一到周日", set(maps.TREASURE_ROTATION) == set(range(7)))
+check("周一是霞谷", knowledge.get_treasure_maps(0) == ["霞谷"])
+check("周日是雨林/暮土/禁阁",
+      knowledge.get_treasure_maps(6) == ["雨林", "暮土", "禁阁"])
+check("星期越界按 7 取模（7 = 周一）",
+      knowledge.get_treasure_maps(7) == knowledge.get_treasure_maps(0))
+check("非法输入返回空列表", knowledge.get_treasure_maps("x") == [])
+check("表内的地图名都存在",
+      all(m in maps.MAPS for v in maps.TREASURE_ROTATION.values() for m in v))
+check("query('今天大蜡烛在哪') 给出周轮换表",
+      any("大蜡烛·周轮换" in s for s in knowledge.query("今天大蜡烛在哪")))
+check("周轮换表文本同时含周一与周日",
+      "周一" in knowledge.describe_treasure_rotation()
+      and "周日" in knowledge.describe_treasure_rotation())
+
+# ── 区域名归属（玩家常直接报区域名）──
+check("区域索引排除了与地图/别名重名的词",
+      not ({"圣岛", "风行网道", "云巢", "圆梦村", "暴风眼",
+            "伊甸之眼", "星光沙漠"} & set(knowledge._area_index())))
+check("query('我在四龙图') 归属到暮土",
+      any("地图·暮土" in s for s in knowledge.query("我在四龙图")))
+check("query('秘密花园在哪') 归属到雨林",
+      any("地图·雨林" in s for s in knowledge.query("秘密花园在哪")))
+check("query('我要去圣岛') 命中的是地图圣岛（不是云野的区域）",
+      any("地图·圣岛" in s for s in knowledge.query("我要去圣岛")))
 
 # 物品
 REQUIRED_ITEM_FIELDS = {"type", "acquisition", "usage"}

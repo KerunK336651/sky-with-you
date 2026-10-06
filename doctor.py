@@ -536,6 +536,10 @@ def check_window(report, probes):
                    % (w, h))
     elif h < 720:
         report.warn("游戏窗口高度 %d 偏小 —— 模板按 1080p 标定，小窗口下 ROI/模板分可能不准" % h)
+    elif (w, h) != (1920, 1080):
+        report.warn("客户区 %dx%d 不是标定的 1920x1080 —— 模板会按帧高缩放到 %.3f 倍，"
+                    "偏离越多插值误差越大；跑 `py window_fix.py --apply` 可一键对齐"
+                    "（改完不用动游戏里的画质设置）" % (w, h, h / 1080.0))
 
 
 def check_mcp(report, probes):

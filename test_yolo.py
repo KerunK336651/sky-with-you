@@ -28,6 +28,13 @@ FindWindowW = ctypes.windll.user32.FindWindowW
 GetWindowRect = ctypes.windll.user32.GetWindowRect
 IsWindowVisible = ctypes.windll.user32.IsWindowVisible
 
+# 必须先声明 DPI 感知：GetWindowRect 给的是逻辑像素、mss 抓的是物理像素，
+# 在 125%/150% 缩放的显示器上两者会错开，截出来的验证图会错位/缺边（2026-10-06 补）。
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]

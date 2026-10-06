@@ -326,6 +326,12 @@ expect("找不到游戏窗口 -> 警告但退出码仍为 0",
 rep, _, _ = run(FakeProbes(window={"title": "光·遇", "left": 0, "top": 0,
                                    "width": 1600, "height": 900}))
 expect("窗口正常 -> 通过并回显尺寸", has_ok(rep, "1600x900"))
+expect("1600x900 不是 1920x1080 -> 提示可用 window_fix.py 对齐",
+       has_warn(rep, "window_fix") and not rep.errors)
+
+rep, _, _ = run(FakeProbes(window=GOOD_WINDOW))
+expect("正好 1920x1080 -> 不提示分辨率",
+       not has_warn(rep, "window_fix") and not has_warn(rep, "不是标定"))
 
 rep, _, _ = run(FakeProbes(window={"title": "光·遇", "left": 0, "top": 0,
                                    "width": 120, "height": 90}))

@@ -10,6 +10,12 @@ GetWindowTextLengthW = ctypes.windll.user32.GetWindowTextLengthW
 IsWindowVisible = ctypes.windll.user32.IsWindowVisible
 GetWindowRect = ctypes.windll.user32.GetWindowRect
 
+# 必须先声明 DPI 感知，否则量到的是逻辑像素（125%/150% 缩放下与实际像素不符）。
+try:
+    ctypes.windll.user32.SetProcessDPIAware()
+except Exception:
+    pass
+
 class RECT(ctypes.Structure):
     _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
                 ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
