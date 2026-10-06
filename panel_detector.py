@@ -61,6 +61,64 @@ try:
 except Exception:
     RapidOCR = None
 
+# OCR 推理设备：auto（有 DirectML 就用 GPU）/ dml（强制 GPU）/ cpu（强制 CPU）
+# DirectML 走 DirectX 12，AMD/N卡/核显通用；实测 RX5600XT 上 OCR 提速约 3 倍，
+# 能直接缓解多人场景 OCR 排队卡死。需安装 onnxruntime-directml（与 CPU 版互斥）。
+OCR_DEVICE = os.environ.get("SKY_OCR_DEVICE", "auto").lower().strip()
+
+# OCR 模型版本：v3（RapidOCR 自带，稳定）/ v5（PP-OCRv5，行切分更干净、
+# 支持简繁/拼音/日文，模型在 models/ocr/，缺失时自动回退 v3）。
+OCR_MODEL = os.environ.get("SKY_OCR_MODEL", "v3").lower().strip()
+_OCR_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "ocr")
+_OCR_V5 = {
+    "det": os.path.join(_OCR_DIR, "v5_det.onnx"),
+    "rec": os.path.join(_OCR_DIR, "v5_rec.onnx"),
+    "keys": os.path.join(_OCR_DIR, "ppocr_keys_v5.txt"),
+}
+
+
+def _patch_rapidocr_dml():
+    """让 RapidOCR 的 onnxruntime session 优先走 DirectML；并让 rec_keys_path
+    正确落到 config['keys_path']。返回是否启用了 DML。
+
+    注意：补丁是打在 rapidocr_onnxruntime.utils.InferenceSession 上的进程级全局替换，
+    **一旦打上，本进程内再改 OCR_DEVICE='cpu' 也不会退回 CPU**。正常情况下无影响——
+    OCR_DEVICE 只在 import 时从环境变量读一次，运行中不会改。但手工做对比实验时
+    必须"先测 cpu 再测 auto/dml"，否则会看到与预期相反的结果（test_ocr_engine.py
+    就是按这个顺序写的）。"""
+    dml_on = False
+    try:
+        import rapidocr_onnxruntime.utils as _u
+        import onnxruntime as _ort
+
+        # 1) DirectML（仅在 auto/dml 时启用；cpu 时强制走 CPU）
+        if OCR_DEVICE in ("auto", "dml") \
+                and "DmlExecutionProvider" in _ort.get_available_providers():
+            _orig = _u.InferenceSession
+            if not getattr(_orig, "_sky_dml_patched", False):
+                def _patched(model_path, sess_options=None, providers=None, **kw):
+                    providers = [("DmlExecutionProvider", {"device_id": 0})] + (providers or [])
+                    return _orig(model_path, sess_options=sess_options,
+                                 providers=providers, **kw)
+                _patched._sky_dml_patched = True
+                _u.InferenceSession = _patched
+            dml_on = True
+
+        # 2) 修正 rec_keys_path -> keys_path（RapidOCR 只对 rec_model_path 去前缀）
+        _orig_ur = _u.UpdateParameters.update_rec_params
+        if not getattr(_orig_ur, "_sky_keys_patched", False):
+            def _ur_patched(self, config, rec_dict):
+                config = _orig_ur(self, config, rec_dict)
+                if "rec_keys_path" in config:
+                    config["keys_path"] = config.pop("rec_keys_path")
+                return config
+            _ur_patched._sky_keys_patched = True
+            _u.UpdateParameters.update_rec_params = _ur_patched
+    except Exception as e:
+        # 补丁失败原本是静默的：程序照跑、但会悄悄退回 CPU，日志里查不出原因
+        print("  [PD] DirectML/字典补丁失败，OCR 将走 CPU 或退回 v3: %s" % e)
+    return dml_on
+
 
 def _tame_process(max_cores=None):
     """Windows: 降低本进程优先级（让游戏优先），并把进程钉在若干核上。
@@ -98,14 +156,70 @@ def _tame_process(max_cores=None):
 _tame_process()
 
 
+def _log_ocr_engine(eng):
+    """打印 OCR 引擎【实际生效】的模型与推理设备。
+
+    用模型指纹判断而不是回显请求值——请求 v5 却静默退回 v3、请求 GPU 却走了 CPU，
+    这两件事以前都看不出来（程序照样跑，只是变慢变差）。启动时 3 个调用点各打一行，
+    真机核对"三个 OCR 引擎是否都上了 GPU/是否真用了 v5"就看这三行。
+    """
+    try:
+        if eng is None:
+            print("  [PD] OCR 引擎: 不可用（RapidOCR 未安装）")
+            return
+        classes = eng.text_recognizer.session.session.get_outputs()[0].shape[-1]
+        model = {18385: "PP-OCRv5", 6625: "PP-OCRv3"}.get(classes, "未知(%d 类)" % classes)
+        prov = eng.text_detector.infer.session.get_providers()[0]
+        extra = ""
+        if prov == "CPUExecutionProvider" and OCR_DEVICE in ("auto", "dml"):
+            try:
+                import onnxruntime as _ort
+                if "DmlExecutionProvider" not in _ort.get_available_providers():
+                    extra = "（未检测到 DirectML，GPU 加速不可用：pip install onnxruntime-directml）"
+            except Exception:
+                pass
+        print("  [PD] OCR 引擎: %s + %s%s" % (model, prov, extra))
+    except Exception as e:
+        print("  [PD] OCR 引擎: 已创建（状态读取失败: %s）" % e)
+
+
 def make_ocr_engine():
-    """创建 RapidOCR，尽量限住 onnxruntime 内部线程数（旧版不认这些参数则回退）。"""
+    """创建 RapidOCR。默认优先 DirectML(GPU)，失败回退 CPU；
+    SKY_OCR_MODEL=v5 且 models/ocr 文件齐全时用 PP-OCRv5，否则回退自带 v3。
+    建完会打一行"实际生效"日志（见 _log_ocr_engine）。"""
     if RapidOCR is None:
         return None
-    try:
-        return RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
-    except Exception:
-        return RapidOCR()
+    _patch_rapidocr_dml()
+
+    use_v5 = OCR_MODEL == "v5" and all(os.path.exists(p) for p in _OCR_V5.values())
+    if OCR_MODEL == "v5" and not use_v5:
+        print("  [PD] 未找到 models/ocr 下的 v5 模型，回退自带 v3")
+
+    eng = None
+    # v5 路线（含逐级回退）
+    if use_v5:
+        try:
+            eng = RapidOCR(det_model_path=_OCR_V5["det"],
+                           rec_model_path=_OCR_V5["rec"],
+                           rec_keys_path=_OCR_V5["keys"])
+        except Exception as e:
+            print("  [PD] v5 引擎创建失败，回退 v3:", e)
+
+    # v3 路线（GPU 优先，失败回退 CPU，CPU 限线程）
+    if eng is None and OCR_DEVICE in ("auto", "dml"):
+        try:
+            import onnxruntime as _ort
+            if "DmlExecutionProvider" in _ort.get_available_providers():
+                eng = RapidOCR()
+        except Exception:
+            pass
+    if eng is None:
+        try:
+            eng = RapidOCR(intra_op_num_threads=2, inter_op_num_threads=1)
+        except Exception:
+            eng = RapidOCR()
+    _log_ocr_engine(eng)
+    return eng
 
 
 # ===================== 配置 =====================

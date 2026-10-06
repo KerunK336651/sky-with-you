@@ -3,6 +3,13 @@ numpy
 opencv-python
 mss
 rapidocr_onnxruntime
+# 可选：OCR GPU 加速（DirectML，AMD/N卡/核显通用，实测提速约 3 倍，缓解多人卡死）。
+# 安装后会替换 CPU 版 onnxruntime：pip install onnxruntime-directml
+# 不装也能用（CPU 较慢）；环境变量 SKY_OCR_DEVICE=auto/dml/cpu 控制（默认 auto）
+#
+# OCR 模型版本（环境变量 SKY_OCR_MODEL=v3/v5，默认 v3）：
+#   v3 = RapidOCR 自带模型；v5 = PP-OCRv5（models/ocr 已随仓库附带，行切分更干净、
+#   支持简繁/拼音/日文）。一键用 v5 跑 start_loop_v5.bat；模型文件缺失会自动回退 v3。
 openai
 requests
 # YOLO 牵手/输入框检测（默认开启；不装则自动退回模板匹配，torch 会作为依赖一并安装，较大）
