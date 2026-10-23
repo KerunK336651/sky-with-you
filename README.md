@@ -59,7 +59,11 @@ python -m pip install -r requirements.txt
    下载（权重以 CC BY-NC-SA 4.0 发布，校验值见 Release 中的 `SHA256SUMS`），
    放到程序默认模型路径；也可用 `train_yolo.py` 自行采集标注后训练生成。
    基础模型 `yolov8n.pt` 由 ultralytics 首次运行自动下载。
-   不装 YOLO 也能靠模板匹配正常运行
+   不装 YOLO 也能靠模板匹配正常运行。
+
+   > **安全提示**：`.pt` 基于 pickle，加载时可执行代码。请只从本仓库官方
+   > Release 下载，不要使用第三方网盘、群文件或不明链接里的 `best.pt`；
+   > 下载后用 `SHA256SUMS` 校验，哈希不符即被篡改。
 
 ## 启动（两个终端）
 
