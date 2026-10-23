@@ -41,7 +41,7 @@ import cv2
 from rapidocr_onnxruntime import RapidOCR
 
 from panel_detector import (PanelDetector, DetectorConfig, Screen,
-                            find_game_client_region, make_ocr_engine)
+                            find_game_client_region, make_ocr_engine, ocr_infer)
 
 # ── 移植自 sky-companion 的核心模块 ──
 from core.llm_client import LLMClient
@@ -50,6 +50,10 @@ from core.memory import (
     companion_replies, memory_pending_turns, build_memory_update_prompt,
     clean_memory_summary, load_search_knowledge, add_search_knowledge,
     search_knowledge_prompt, load_style_knowledge, save_style_knowledge,
+    diary_recent, diary_recall, add_diary_entry,
+    _atomic_write_json, _load_json, USER_DATA_DIR,
+    weekly_recent, monthly_recent, yearly_recent, summary_recall,
+    summarize_due_periods, due_periods,
 )
 from core.web_search import search_web, format_results
 from core.reply_engine import (
@@ -57,7 +61,7 @@ from core.reply_engine import (
     polish_reply, reply_too_similar, rewrite_repetitive_reply,
     recent_laugh_count, fallback_reply, must_reply, answer_from_search,
 )
-from core.style_learner import learn_style, style_prompt_key
+from core.style_learner import learn_style, style_prompt_key, player_style_profile
 from core.vision_client import VisionClient, pose_press_delta
 
 # 本地知识库（可选；缺失时不影响主流程）
@@ -103,6 +107,10 @@ SUMMARY_MODEL = MODEL
 
 # 记忆
 MEMORY_UPDATE_MIN_PENDING = 6
+# 记忆整合输出上限：整合器要原样保留【稳定】(最多1200字≈1600token) + 【最近】(200字)
+# + 【日记】(100字)，520token 只够输出稳定段，导致最近段被截断、日记段永远不输出。
+# 2200 能容纳完整三段；SKY_MEMORY_MAX_TOKENS 可调。
+MEMORY_UPDATE_MAX_TOKENS = int(os.environ.get("SKY_MEMORY_MAX_TOKENS", "2200") or 2200)
 
 # 搜索
 SEARCH_ENABLED = os.environ.get("SKY_SEARCH_ENABLED", "1") != "0"
@@ -124,8 +132,16 @@ WHITELIST_ENABLED = os.environ.get("SKY_WHITELIST_ENABLED", "1") != "0"
 WHITELIST = [n.strip() for n in os.environ.get("SKY_WHITELIST", "珂珂").split(",") if n.strip()]
 
 WATCH_INTERVAL   = 0.10
+# watch 真实节拍的打印间隔（秒）。真机反推只有 ~1 拍/秒，与设计值 10 拍/秒差一个量级，
+# 而硬门防抖/邀请确认帧这些"按拍计数"的参数都按 0.4s/拍算，差多少必须看得见。
+WATCH_CADENCE_LOG_EVERY = float(os.environ.get("SKY_WATCH_CADENCE_LOG_EVERY", "60.0"))
 OCR_COOLDOWN     = 1.5
 OCR_FALLBACK     = 10.0
+# P0 插桩（2026-10-17）：只加日志、不改任何判定。用来分辨"背景动画噪声的帧差"和
+# "真新消息到达的帧差"，并统计完整文本是否真的变了；采一轮真机日志后据此定双阈值。
+# 采完可设 SKY_OCR_DIAG=0 关掉，无需改代码。
+OCR_DIAG         = os.environ.get("SKY_OCR_DIAG", "1") != "0"
+_ocr_diag_last_full = None   # 上一次 OCR 的完整文本（不截断），仅用于判断"全文是否变化"
 CONFIRM_COOLDOWN = 6.0
 REOPEN_COOLDOWN  = 6.0
 PANEL_REOPEN_DELAY = 1.2  # 面板必须持续判关这么久才按C打开，滤掉瞬时漏检/抖动，避免把开着的面板按关
@@ -135,6 +151,37 @@ GOHOME_COOLDOWN  = 45.0
 MAX_MSGS        = 40
 SUMMARY_TRIGGER = 30
 SUMMARY_KEEP    = 15
+
+# ── 事件日记四层检索（记忆 v4）──
+# ① 默认层：每次注入最近 DIARY_INJECT_RECENT 条日记（零检索成本）
+# ② 触发层：消息命中回忆触发词 → 本地检索注入
+# ③ 检索层：标签命中(权重5)+字面交集(权重1) 双通道打分（core/memory.diary_recall）
+# ④ 协议层：AI 可输出 [RECALL]关键词[/RECALL] 自主发起检索 → 重答一次；
+#    冷却 SKY_RECALL_COOLDOWN 秒内只许一次，重答里再出现 RECALL 一律剥离（防递归烧token）
+DIARY_INJECT_RECENT = int(os.environ.get("SKY_DIARY_INJECT_RECENT", "3") or 3)
+RECALL_COOLDOWN = float(os.environ.get("SKY_RECALL_COOLDOWN", "15") or 15)
+RECALL_TRIGGER_WORDS = (
+    "上次", "那天", "还记得", "第一次", "之前聊", "什么时候",
+    "当初", "曾经", "回忆", "认识多久", "多久了",
+)
+_RECALL_TAG_RE = re.compile(r"\[RECALL\](.*?)\[/RECALL\]", re.S)
+_recall_last_used = 0.0  # 上次 RECALL 时间戳（模块级，冷却控制）
+
+# ── 分层记忆（记忆金字塔）：周记（周一切分）/月记/年记 ──
+# 启动时自动补压缩已结束周期（SKY_SUMMARY_ON_STARTUP=0 可关，改用 summarize_memory.py）
+SUMMARY_ON_STARTUP = os.environ.get("SKY_SUMMARY_ON_STARTUP", "1") != "0"
+# 日常常驻注入最近一篇周记（"这周在干嘛"的连续感）；月/年记只在触发词命中时检索
+WEEKLY_RECALL_WORDS = (
+    "这周", "本周", "上周", "这一周", "上一周", "这周都",
+)
+MONTHLY_RECALL_WORDS = (
+    "这个月", "上个月", "本月", "上月", "这一个月", "这阵子", "最近一阵",
+)
+YEARLY_RECALL_WORDS = (
+    "今年", "去年", "这一年", "年度", "这一年来",
+)
+# 对话窗口持久化：重启接着聊（存最近 MAX_MSGS 条，原子写）
+CONVERSATION_FILE = os.path.join(USER_DATA_DIR, "conversation.json")
 
 DEBUG = True
 # AI 对话转储开关：设 SKY_AI_TRACE=1 后，把每次发给LLM的完整输入/原始返回/最终处理
@@ -156,11 +203,96 @@ SELF_NAMES = ("星河",)     # AI操控的小号名字（自己的消息标记�
 # SKY_YOLO_MODEL=模型路径
 # SKY_YOLO_CONF=置信度阈值
 YOLO_ENABLED = os.environ.get("SKY_YOLO_ENABLED", "1") != "0"
+# 默认模型：22 类 v6 版（0-11 同 v5：chat_input/hand_icon/open_tree_icon/accept_hug/
+# accept_carry/accept_high_five/accept_fist_bump/follow/wing_light/light/focus/seat；
+# 12-21 新增：bear_hug/curtain_call/fancy_high_five/handshake/head_pat/mutual_light/
+# play_fight/shoulder/spin_dance/whisper），同学笔记本 N 卡 batch4 imgsz960 训练，
+# 2026-10-21 验收（97 轮，best 第 72 轮），val：precision0.996/recall1.0/mAP50 0.995/
+# mAP50-95 0.914，每类 recall 均为 1.0。旧 12 类模型保留在
+# runs/detect/sky_v5_12cls/weights/best.pt，需要回退时设 SKY_YOLO_MODEL 指向它即可。
 YOLO_MODEL_PATH = os.environ.get("SKY_YOLO_MODEL",
     os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "runs", "detect", "runs", "detect", "train", "weights", "best.pt"))
+                 "runs", "detect", "sky_v6_22cls", "weights", "best.pt"))
 YOLO_CONF_THRESHOLD = float(os.environ.get("SKY_YOLO_CONF", "0.8"))
 YOLO_DETECT_INTERVAL = 0.4  # YOLO检测间隔（秒），1秒约2.5次
+
+# ── 好友互动邀请（对方发起 抱抱/背背/击掌/碰拳，屏幕出现圆形“接受”图标）──
+# SKY_ACCEPT_AUTO=1 才真正自动按 F 接受；默认 0=只观测、打印 [互动邀请] 日志但不按 F。
+# 先用观测模式在真机确认：邀请检出准、图标上方名字识别对、传送/加入等危险界面不会误触发，
+# 再打开自动（见任务阶段2/3）。
+ACCEPT_AUTO = os.environ.get("SKY_ACCEPT_AUTO", "0") == "1"
+ACCEPT_CONF = float(os.environ.get("SKY_ACCEPT_CONF", "0.8"))  # 接受图标的判定阈值（实测最低0.86）
+ACCEPT_CONFIRM_FRAMES = int(os.environ.get("SKY_ACCEPT_FRAMES", "2"))  # 连续几拍检测到才认定（防抖）
+ACCEPT_COOLDOWN = float(os.environ.get("SKY_ACCEPT_COOLDOWN", "12.0"))  # 同一动作事件触发后冷却秒数
+# 连续多少拍没检测到才认定图标真消失（消失宽限，防单帧漏检被当成新邀请）。约 0.4s/拍。
+ACCEPT_MISS_FRAMES = int(os.environ.get("SKY_ACCEPT_MISS_FRAMES", "3"))
+# 阶段3（B2）拟人执行参数：
+# AI 同意后，台词发出到真正按 F 之间的自然延迟（让对方看到台词、像真人反应）。
+ACCEPT_PRESS_DELAY = float(os.environ.get("SKY_ACCEPT_PRESS_DELAY", "2.0"))
+# 兜底：邀请首次出现后，AI 一直没产出有效决策（verdict 仍 pending）超过该秒数，
+# 且邀请安全（白名单/读不到名字），自动按 F 接受。AI 明确 decline 时不兜底。
+ACCEPT_FALLBACK_SECONDS = float(os.environ.get("SKY_ACCEPT_FALLBACK", "15.0"))
+# 模型 class id -> (内部动作名, 中文动作名)，顺序与 data.yaml/classes.txt 锁定一致，勿改
+# 0-11 为 v5 原有；12-21 为 v6 新增的双人互动邀请（均按 F 接受）。
+# 17 mutual_light（互火）是星盘鼠标点击、不是 F 邀请，故不纳入，只识别。
+ACCEPT_CLASSES = {
+    3: ("accept_hug", "抱抱"),
+    4: ("accept_carry", "背背"),
+    5: ("accept_high_five", "击掌"),
+    6: ("accept_fist_bump", "碰拳"),
+    12: ("bear_hug", "熊抱"),
+    13: ("curtain_call", "谢幕"),
+    14: ("fancy_high_five", "花式击掌"),
+    15: ("handshake", "握手"),
+    16: ("head_pat", "摸头"),
+    18: ("play_fight", "打闹"),
+    19: ("shoulder", "搭肩"),
+    20: ("spin_dance", "共舞"),
+    21: ("whisper", "耳语"),
+}
+
+# ── 拟人互动·阶段2（Delta B1）：邀请事件喂给 LLM，星河先开口反应（台词），
+#    但【不按 F、不接受】，让互动有人味、不秒接；只发一句台词，零风险。
+#    SKY_INTERACT_REACT=0 关闭（默认开）；只在白名单/默认接受的邀请触发（陌生人不理）。
+#    离线测试（2026-10）确认：动作类型以 YOLO 为准（VLM 会把圆形图标都判成 hug，
+#    不可信），VLM 只辅助看场景；阶段3（B2）才在反应后按 F + 15 秒兜底。
+INTERACT_REACT_ENABLED = os.environ.get("SKY_INTERACT_REACT", "1") != "0"
+
+# ── wing_light 光翼硬门（无翼小号保护，最高优先）：附近检出光翼时，在集中按键函数
+#    _key 上拦截所有 F，绝不自动拾取（无翼捡光翼不可恢复）。只拦截、不新增自动按键。
+#    SKY_WING_LIGHT_GUARD=0 关闭（默认开）；进入防抖，退出迟滞（见 watch_loop）。
+WING_LIGHT_GUARD_ENABLED = os.environ.get("SKY_WING_LIGHT_GUARD", "1") != "0"
+WING_LIGHT_CONF = float(os.environ.get("SKY_WING_LIGHT_CONF", "0.8"))  # 光翼检出阈值
+WING_LIGHT_FRAMES = int(os.environ.get("SKY_WING_LIGHT_FRAMES", "2"))  # 连续几拍检出才进入防护（防抖）
+WING_LIGHT_HOLD = float(os.environ.get("SKY_WING_LIGHT_HOLD", "2.0"))  # 最后检出后多少秒内继续拦截（退出迟滞）
+# 新鲜度看护（2026-10-19 修 P0，见第六十三/六十四章）：正常运行时 seen=True 意味着 last_seen
+# 至多 HOLD+检测间隔 秒前。若 seen 长时间为 True 却没再刷新，只可能是 wing_light_step 没被
+# 调用（YOLO 失效/模型 None/取不到帧/检测异常被吞）或存在持续误检 —— 此时 F 会被永久静默锁死。
+# 这里**不自动解锁**（安全优先，绝不冒险拾取光翼），只周期性大声告警让问题可见。
+WING_LIGHT_STALE_WARN = float(os.environ.get("SKY_WING_LIGHT_STALE_WARN", "15.0"))  # 超过多少秒未刷新算可疑
+WING_LIGHT_WARN_EVERY = float(os.environ.get("SKY_WING_LIGHT_WARN_EVERY", "10.0"))  # 告警最小间隔秒
+# 逃生开关：确认是误检时才手动设（>0 生效，超过该秒数强制解除防护）。默认 0 = 永不自动解除。
+WING_LIGHT_MAX_HOLD = float(os.environ.get("SKY_WING_LIGHT_MAX_HOLD", "0"))
+
+# ── 光翼"UI 提示 F 安全窗"（2026-10-20 修 P0，见第七十章）────────────────────────
+# 背景：open_tree_icon 与 wing_light 在同一枚圆形 F 图标上 elif 竞争分类，真机日志实证
+# 两类会在相邻两拍摇摆（826 行 open_tree 0.91 / 827 行 [Guard] 进入防护）。硬门只在
+# wing_light 那一拍胜出时才亮，open_tree 胜出的拍里"对着 UI 提示按 F"完全无保护。
+# 对策：凡是对着屏幕上的圆形 F 提示按 F 的动作（好友树入口 / 接受邀请 / 牵手），
+# 额外要求"最近 WING_LIGHT_F_SAFE_WINDOW 秒内从未检出过 wing_light"。
+WING_LIGHT_F_SAFE_WINDOW = float(os.environ.get("SKY_WING_LIGHT_F_SAFE_WINDOW", "30.0"))
+# 硬门未生效时是否仍允许这类 F（fail-safe 默认否：宁可不抱抱，也不冒拾光翼的风险）。
+# 确认 YOLO 确实不可用且能人工保证安全时，才设 SKY_F_ALLOW_WITHOUT_GUARD=1 放行。
+F_ALLOW_WITHOUT_GUARD = os.environ.get("SKY_F_ALLOW_WITHOUT_GUARD", "0") == "1"
+# 光翼类在模型里的名字（23 类模型若改名，用本变量对齐，不要把名字写死在多处）
+WING_LIGHT_CLASS_NAME = os.environ.get("SKY_WING_LIGHT_CLASS_NAME", "wing_light")
+
+# YOLO 实时预览窗口：SKY_YOLO_PREVIEW=1 时弹出一个窗口，显示游戏画面叠加 YOLO 识别框
+# （7 类 + 类别名 + 置信度），用于直观看“YOLO 此刻识别到了什么”。默认关，不影响运行。
+# 窗口里按 q 或点右上角 × 只关闭预览，主程序继续跑。
+YOLO_PREVIEW = os.environ.get("SKY_YOLO_PREVIEW", "0") == "1"
+YOLO_PREVIEW_SCALE = float(os.environ.get("SKY_YOLO_PREVIEW_SCALE", "0.67"))  # 1920宽→约1280显示
+_PREVIEW_WIN = "Sky YOLO Preview  (q=关闭预览)"
 
 # 牵手图标上方名字 OCR 确认（避免误牵其他人）
 # SKY_NAME_OCR_ENABLED=1 开启, =0 关闭（默认开启）
@@ -194,6 +326,32 @@ _yolo_chat_input_conf = 0.0        # 最近一次检测的置信度
 _yolo_chat_input_bbox = None       # 最近一次检测到的聊天输入框位置
 _yolo_open_tree_detected = False   # 最近一次YOLO是否检测到好友树入口图标（按F打开好友树）
 _yolo_open_tree_conf = 0.0         # 最近一次检测的置信度
+
+# 好友互动邀请 accept_*（class 3-6）：最近一次检测结果 {action_name: (conf, bbox)}
+_yolo_accept = {}
+# 最近一次 YOLO 检测的全部框（供预览窗口画框）：[(cls, conf, (x1,y1,x2,y2), name)]，及检测时间
+_yolo_preview_boxes = []
+_yolo_preview_time = 0.0
+
+# wing_light 光翼硬门状态（watch_loop 按 YOLO 检测更新，_key 读取）：
+_yolo_wing_light_seen = False     # 防抖后的当前状态：附近有光翼（防护态）
+_yolo_wing_light_frames = 0       # 连续检出计数（进入防抖）
+_yolo_wing_light_last_seen = 0.0  # 最后一次检出时间（退出迟滞）
+_yolo_wing_light_warn_at = 0.0    # 上次打印“防护态可疑”告警的时间（限流用）
+# 光翼硬门是否真的在线（YOLO 已加载 且 模型里有 wing_light 类）。False 时按 fail-safe
+# 处理：拒绝"对着 UI 提示按 F"的动作（见 f_prompt_press_allowed），并在启动日志大字告警。
+_wing_light_guard_online = False
+# 观测防抖/去重（仅 watch_loop 用）：连续拍数 / 上次事件时间 / 是否在屏 / 本轮首次出现时间
+_accept_seen = {name: 0 for name, _ in ACCEPT_CLASSES.values()}
+_accept_event_time = {name: None for name, _ in ACCEPT_CLASSES.values()}  # None=从未触发
+_accept_present = {name: False for name, _ in ACCEPT_CLASSES.values()}
+_accept_first_seen = {name: None for name, _ in ACCEPT_CLASSES.values()}
+# 本次 present 周期是否已把邀请喂给 AI（事件级去重：一个持续图标只反应一次，图标消失才重置）
+_accept_event_fed = {name: False for name, _ in ACCEPT_CLASSES.values()}
+_accept_miss = {name: 0 for name, _ in ACCEPT_CLASSES.values()}  # 连续漏检拍数（消失宽限）
+# 阶段3（B2）邀请决策状态：aname -> "pending"(图标在、等AI)/"accept"(AI同意,待按F)/
+# "decline"(AI拒绝)/"done"(已按F接受)。None=当前无该邀请。图标消失时清回 None。
+_accept_verdict = {name: None for name, _ in ACCEPT_CLASSES.values()}
 
 # 确认对话框处理中标志（阻止重复触发确认）
 _confirm_in_progress = False
@@ -280,10 +438,94 @@ def mcp(tool, args=None, session=None):
 
 # ===================== SharedState（对话 + 记忆 + 搜索 + 风格） =====================
 
+def _apply_recall_protocol(reply, work_messages, state, llm_client, player_msg=""):
+    """记忆 v4 ④：处理 AI 输出的 [RECALL]关键词[/RECALL] 协议（AI 自主检索日记）。
+
+    规则（防失控三道闸）：
+      - 冷却：SKY_RECALL_COOLDOWN 秒内只处理一次，期内直接剥离标签用原回复（不调 LLM）
+      - 深度：无论检索有没有结果，最多重新生成 1 次；重答结果无条件剥离标签（防递归烧token）
+      - 空手：检索无结果时如实告知模型，让它诚实说"记不清"，而不是继续乱猜
+    任何路径返回前都会剥离 [RECALL] 标签 —— 绝不让暗号出现在游戏输入框。
+
+    返回 (final_reply, used_recall: bool)
+    """
+    reply = reply or ""
+    m = _RECALL_TAG_RE.search(reply)
+    if not m:
+        # 保险：普通回复里万一残留标签也剥掉
+        return _RECALL_TAG_RE.sub("", reply).strip(), False
+    now = time.time()
+    if now - getattr(state, "recall_last_used", 0.0) < RECALL_COOLDOWN:
+        return _RECALL_TAG_RE.sub("", reply).strip(), False
+    state.recall_last_used = now
+    kw = (m.group(1) or "").strip() or str(player_msg or "")
+    # 同时检索事件日记（diary_recall）与分层总结（周/月/年记，summary_recall）
+    hits = diary_recall(kw)
+    sum_hits = summary_recall(kw, levels=("weekly", "monthly", "yearly"))
+    parts = []
+    if hits:
+        parts.append("【事件日记】\n"
+                     + "\n".join(f"- {i['time']} {i['event']}" for _, i in hits))
+    if sum_hits:
+        _lv_name = {"weekly": "周记", "monthly": "月记", "yearly": "年记"}
+        parts.append("【周记/月记/年记】\n"
+                     + "\n".join(f"- [{_lv_name.get(lv, lv)}] {it.get('period','')}："
+                                 f"{it.get('text','')}" for _, lv, it in sum_hits))
+    if parts:
+        feed = ("（系统已帮你检索记忆，关键词「%s」，找到：\n%s\n"
+                "请基于以上记忆自然回答珂珂，不要再输出 [RECALL] 标签）"
+                % (kw, "\n".join(parts)))
+    else:
+        feed = ("（系统已帮你检索记忆（事件日记和周/月/年记都查过），关键词「%s」，"
+                "但没有找到相关记录。请诚实自然地回应，可以说自己记不清了，"
+                "不要再输出 [RECALL] 标签）" % kw)
+    # 标准 tool 模式：把带 RECALL 的原回复 + 检索结果一起给模型，让它接着答
+    work_messages.append({"role": "assistant", "content": reply})
+    work_messages.append({"role": "user", "content": feed})
+    print(f"  [Diary] AI 自主RECALL「{kw}」→ 事件{len(hits)}条 "
+          f"分层{len(sum_hits)}篇，重新作答")
+    try:
+        msg2 = llm_client.chat_raw(work_messages, temperature=0.7, max_tokens=300)
+        final = msg2.get("content") or reply
+    except Exception as e:
+        print(f"  [Diary] RECALL 重答失败，回退原回复: {e}")
+        final = reply
+    return _RECALL_TAG_RE.sub("", final).strip(), True
+
+
+def _load_conversation() -> list:
+    """启动时加载持久化的对话窗口（重启接着聊）。无文件/损坏时空列表启动。"""
+    try:
+        data = _load_json(CONVERSATION_FILE)
+    except Exception:
+        data = None
+    if not isinstance(data, list):
+        return []
+    conv = [
+        m for m in data
+        if isinstance(m, dict)
+        and m.get("role") in ("user", "assistant")
+        and isinstance(m.get("content"), str)
+        and m["content"].strip()
+    ]
+    return conv[-MAX_MSGS:]
+
+
+def _save_conversation(conv) -> None:
+    """把对话窗口原子写到磁盘（最近 MAX_MSGS 条；失败只打日志，绝不让主循环崩）。"""
+    try:
+        _atomic_write_json(CONVERSATION_FILE, list(conv)[-MAX_MSGS:])
+    except Exception as e:
+        print(f"  [Conv] 对话持久化失败: {e}")
+
+
 class SharedState:
     def __init__(self):
         self.lock = threading.Lock()
-        self.conversation: list[dict] = []
+        # 对话窗口持久化（记忆 v4）：重启后从磁盘加载，能接着上次的话题聊
+        self.conversation: list[dict] = _load_conversation()
+        # 记忆 v4：RECALL 协议冷却时间戳
+        self.recall_last_used: float = 0.0
         self.recent_seen: list[tuple[str, float]] = []
         self.sent_history: list[tuple[str, float]] = []
         self.action_busy: bool = False
@@ -319,6 +561,10 @@ class SharedState:
         self.memory_updating: bool = False
         self.search_cache: dict = {}            # {query_key: (timestamp, context)}
 
+        # ── 待处理互动邀请（图标持续在屏期间保留；AI 据此知道邀请是否还在等待）──
+        # {aname: {"action_cn": 中文, "first_seen": 时间}}；watch 线程写、ai_loop 读，均过 state.lock
+        self.pending_invites: dict = {}
+
 # ===================== 面板操作（读 WorldState） =====================
 
 def panel_open(det: PanelDetector) -> bool | None:
@@ -327,7 +573,9 @@ def panel_open(det: PanelDetector) -> bool | None:
        "面板开独有、关必无、位置固定"的锚点，治传统暗横条在关帧咬死 1.00 的死锁
        （续26 实机定性、续42 离线全量验证：开 0.55~0.84 / 关 0~0.44，空档清晰）；
     2. hint 分落在中间带（关闭动画渐隐/亮景火光/没放模板/本帧没算分）时，
-       回退旧的 YOLO OR 传统像素融合。
+       回退 fuse_panel_fallback：YOLO 可用就以 YOLO 为准（不再 OR 传统通道，
+       否则暗场景里传统暗横条会咬死 1.00 把面板判成一直开着，守门于是从不按 C）。
+       回退策略可用 SKY_PANEL_FALLBACK=legacy 切回旧的 OR 语义。
     """
     snap = det.world.snapshot()
     if snap.screen == Screen.LOADING:
@@ -338,13 +586,14 @@ def panel_open(det: PanelDetector) -> bool | None:
         return True
     if state == "closed":
         return False
-    # hint 中间带/无模板：沿用旧双通道融合（YOLO + 传统，任一认为开就判开）
+    # hint 中间带/无模板 -> 本帧看不清，走 fuse_panel_fallback：
+    # 默认 YOLO 可用时**只信 YOLO**。旧写法是 "YOLO OR 传统"，会被暗场景里咬死 1.00 的
+    # 传统暗横条通道带偏 —— 2026-10-06 真机事故：面板实际没开，hint 全程 0.26~0.42 落中间带，
+    # 回退后传统通道给 chat=开(1.00)，于是本函数一直返回 True，守门从不按 C，
+    # 用户看到的就是"按键没触发、聊天面板打不开"。
     traditional = snap.chat_open.value
-    if YOLO_ENABLED and _yolo_model is not None:
-        if _yolo_chat_input_detected or traditional:
-            return True
-        return False
-    return traditional
+    yolo_ok = bool(YOLO_ENABLED and _yolo_model is not None)
+    return fuse_panel_fallback(yolo_ok, _yolo_chat_input_detected, traditional)
 
 
 def wait_panel(det, want: bool, timeout: float) -> bool:
@@ -380,7 +629,93 @@ def _wait_panel_yolo(det, want_closed: bool, timeout: float) -> bool:
     return False
 
 
+def wing_light_step(found, now, seen, frames, last_seen,
+                    frames_needed=WING_LIGHT_FRAMES, hold=WING_LIGHT_HOLD):
+    """纯函数（无副作用）：光翼硬门状态机推进一拍。
+    入参：本拍是否检出 wing_light、当前时刻、上一拍状态（seen/frames/last_seen）。
+    返回新状态 (seen, frames, last_seen)：
+      - 检出：连续帧 +1，达到 frames_needed 才进入防护（防抖），并刷新 last_seen；
+      - 未检出：帧计数清零；已在防护且距 last_seen 超过 hold 才解除（退出迟滞）。
+    供 watch_loop 调用，离线可单测。"""
+    if found:
+        frames = frames + 1
+        if frames >= frames_needed:
+            return True, frames, now
+        return seen, frames, last_seen
+    frames = 0
+    if seen and last_seen and now - last_seen > hold:
+        return False, frames, last_seen
+    return seen, frames, last_seen
+
+
+def f_prompt_press_allowed(now=None, last_seen=None, guard_online=None,
+                           window=None, allow_without_guard=None,
+                           guard_enabled=None):
+    """纯决策（离线可单测）：此刻能否对着**屏幕上的圆形 F 提示**按 F。
+
+    返回 (allowed: bool, reason: str)。allowed=False 时 reason 是被拒原因（直接打日志）。
+
+    为什么需要它（2026-10-20 排查出的 P0，见第七十章）：`_key()` 里的硬门只在
+    `wing_light` 这一拍的分类竞争中胜出时才亮；而 `open_tree_icon` 与 `wing_light`
+    在同一枚图标上是 `elif` 互斥的，真机日志实证会摇摆。于是"为了开好友树/接受邀请
+    而按 F"这条路径在 open_tree 胜出的拍里是裸奔的。这里给它单独加一道**时间窗**：
+    只要最近 window 秒内见过 wing_light，就一律不按（光翼附近本来也不该按 F）。
+    """
+    if guard_enabled is None:
+        guard_enabled = WING_LIGHT_GUARD_ENABLED
+    if not guard_enabled:
+        return True, "硬门已被手动关闭（SKY_WING_LIGHT_GUARD=0）"
+    if guard_online is None:
+        guard_online = _wing_light_guard_online
+    if allow_without_guard is None:
+        allow_without_guard = F_ALLOW_WITHOUT_GUARD
+    if not guard_online and not allow_without_guard:
+        return False, ("光翼硬门未生效（YOLO 不可用或模型无 wing_light 类），"
+                       "拒绝按 F；确认安全可设 SKY_F_ALLOW_WITHOUT_GUARD=1")
+    if window is None:
+        window = WING_LIGHT_F_SAFE_WINDOW
+    now = time.time() if now is None else now
+    last_seen = _yolo_wing_light_last_seen if last_seen is None else last_seen
+    if last_seen and (now - last_seen) <= window:
+        return False, (f"最近 {now - last_seen:.1f}s 内检出过光翼"
+                       f"（安全窗 {window:.0f}s 内禁止对着 UI 提示按 F）")
+    return True, ""
+
+
+def _wing_light_near(now=None):
+    """是否处于光翼附近（防护态）：防抖状态 + last_seen 退出迟滞兜底。
+    供 _key 拦截 F；WING_LIGHT_GUARD_ENABLED 关闭时恒 False。安全优先（宁可多拦）。
+
+    2026-10-19 加新鲜度看护（修第六十三章 P0）：seen 是“粘住”的标志，只有 wing_light_step
+    能解除它。若 step 不再被调用（YOLO 失效/模型 None/取不到帧/检测异常被吞）或存在持续误检，
+    seen 会永远为 True，导致所有 F 被静默永久拦截。这里检测到“seen 长时间未刷新”就周期性
+    大声告警（默认不自动解锁，安全优先）；确认真是误检时可设 SKY_WING_LIGHT_MAX_HOLD 自动解除。
+    """
+    global _yolo_wing_light_seen, _yolo_wing_light_warn_at
+    if not WING_LIGHT_GUARD_ENABLED:
+        return False
+    now = now or time.time()
+    if _yolo_wing_light_seen:
+        age = (now - _yolo_wing_light_last_seen) if _yolo_wing_light_last_seen else 0.0
+        # 逃生开关（默认关）：确认误检时手动开启，超时强制解除
+        if WING_LIGHT_MAX_HOLD > 0 and age > WING_LIGHT_MAX_HOLD:
+            _yolo_wing_light_seen = False
+            print(f"  [Guard] 防护已持续 {age:.0f}s 超过 SKY_WING_LIGHT_MAX_HOLD="
+                  f"{WING_LIGHT_MAX_HOLD:.0f}s，强制解除（用户确认误检时的逃生开关）")
+            return False
+        if age > WING_LIGHT_STALE_WARN and now - _yolo_wing_light_warn_at >= WING_LIGHT_WARN_EVERY:
+            _yolo_wing_light_warn_at = now
+            print(f"  [Guard] ⚠ 警告：防护态已持续 {age:.0f}s 未再刷新，F 仍在拦截中。"
+                  f"通常是 YOLO 未再推进状态机（模型失效/取不到帧/检测异常）或 wing_light 持续误检。"
+                  f"若确认误检：设 SKY_WING_LIGHT_GUARD=0 关硬门，或 SKY_WING_LIGHT_MAX_HOLD=秒数 自动解除。")
+        return True
+    return bool(_yolo_wing_light_last_seen) and now - _yolo_wing_light_last_seen <= WING_LIGHT_HOLD
+
+
 def _key(sess, k, ms=80):
+    if str(k).lower() == "f" and _wing_light_near():
+        print("  [Guard] 附近有光翼，拦截 F（无翼保护，不拾取光翼）")
+        return
     mcp("press_key", {"key": k, "duration_ms": ms, "backend": BACKEND},
         session=sess)
 
@@ -417,11 +752,13 @@ def open_panel_plan(obs, need=2, cooldown=6, max_press=2):
     return acts
 
 
-def _ensure_panel_open_for_watch(det, sess, timeout=5.0, need=2, gap=0.15,
-                                 press_cooldown=1.8, max_press=2):
+def _ensure_panel_open_for_watch(det, sess, timeout=8.0, need=2, gap=0.15,
+                                 press_cooldown=5.0, max_press=2):
     """看门打开聊天面板：连续 need 次确认开才算成功。补按前提更严格——必须从未见过‘开’
     且连续 need 次明确关、距上次按C超 press_cooldown 才补下一次。一旦见过开，说明面板已
-    打开，之后判关是检测漏检，绝不再按C（再按会把开着的面板关掉=肉眼看到的一闪）。"""
+    打开，之后判关是检测漏检，绝不再按C（再按会把开着的面板关掉=肉眼看到的一闪）。
+    press_cooldown=5.0（2026-10-22 由1.8上调）：YOLO 识别聊天框较慢，1.8s 时面板刚打开
+    还没识别上，补按第二次C会把它又关掉；给足5秒、确认真没打开再补。timeout 同步8s。"""
     start = time.time()
     cstreak = ostreak = 0
     presses = 0
@@ -468,6 +805,26 @@ def _open_panel(det, sess, state) -> bool:
         state.last_open_panel_fail = time.time()  # 必须用当前时间，冷却才真正生效
         print("  [Action] 打不开面板，冷却8秒")
     return ok
+
+
+def _reopen_panel_after_action(det, sess, state):
+    """动作（姿势/抱抱）后主动重开聊天面板，不等守门 1.2s，缩短"消息读不到"的窗口。
+    真机根因（2026-10-06 复核）：姿势动作主动关面板、抱抱按F时游戏自动关聊天框，
+    动作结束后代码原本不重开，只等守门，期间玩家说话无人应（"发呆"）。
+    安全：_open_panel 内有 ever_opened 防抖——面板若仍开着不会按 C；回遇境冷却/
+    弹窗/好友树仍在时不动。设 SKY_REOPEN_AFTER_ACTION=0 可整体关闭。"""
+    if not REOPEN_PANEL_AFTER_ACTION:
+        return
+    snap = det.world.snapshot()
+    if snap.screen not in (Screen.IN_WORLD, Screen.HOME):
+        return
+    if snap.confirm_dialog.value or snap.friend_tree.value:
+        return
+    if time.time() - _last_gohome_time < GOHOME_CHAT_COOLDOWN:
+        return
+    if panel_open(det) is not True:
+        print("  [Action] 动作后主动重开聊天面板")
+        _open_panel(det, sess, state)
 
 
 def _close_panel(det, sess) -> bool:
@@ -639,6 +996,21 @@ HINT_BAR_OPEN_MIN = 0.50     # 相关分>=此值 -> 面板开（底部 ESC退后
 HINT_BAR_CLOSED_MAX = 0.20   # 相关分<=此值 -> 面板关（纯游戏画面，无提示行）
 # 二者之间 (0.20, 0.50) = 看不清 / 关闭动画渐隐 / 亮景火光干扰 -> 不表态、回退旧判据
 
+# hint 落中间带时的回退策略（2026-10-06 加）：
+#   yolo（默认）—— YOLO 可用时**只信 YOLO**；
+#   legacy      —— 旧的 "YOLO OR 传统"，任一认为开就判开。
+# 为什么改：真机实测（20:13 那次）面板**实际没开**，但 hint 全程落在中间带
+# （0.26~0.42/unknown），回退到旧融合后，传统暗横条通道给出 chat=开(visual 1.00)，
+# 于是 panel_open() 一直返回 True -> 守门以为面板开着、**从不按 C** ->
+# 用户看到的就是"按键没触发、聊天面板打不开"。
+# 传统通道在暗场景咬死 1.00 是**文档里记过的既有问题**（见 panel_open 的 docstring），
+# hint_bar 当初就是为治它才引入的；既然主裁这帧看不清，就不该让那个已知会误报的通道
+# 单独定论。而 YOLO 是专门训练来认聊天输入框的，且面板真开时它稳定给 0.96~0.97
+# （19:56 那次真机日志），所以"YOLO 在场就以它为准"既治误报、也不引入新的翻转风险。
+# 回退开关：set SKY_PANEL_FALLBACK=legacy
+PANEL_FALLBACK = os.environ.get("SKY_PANEL_FALLBACK", "yolo").strip().lower() or "yolo"
+PANEL_FALLBACK_YOLO_ONLY = PANEL_FALLBACK != "legacy"
+
 
 def judge_panel_by_hint(hint_score, open_min=HINT_BAR_OPEN_MIN,
                         closed_max=HINT_BAR_CLOSED_MAX):
@@ -651,6 +1023,24 @@ def judge_panel_by_hint(hint_score, open_min=HINT_BAR_OPEN_MIN,
     if hint_score <= closed_max:
         return "closed"
     return "unknown"
+
+
+def fuse_panel_fallback(yolo_available, yolo_detected, traditional,
+                        yolo_only=None):
+    """纯决策：hint 落中间带时的回退融合，返回 True(开)/False(关)。
+
+    - YOLO 可用且 yolo_only：**只信 YOLO**（默认，治暗场景传统通道咬死 1.00 的误报）
+    - YOLO 可用且非 yolo_only：旧的 OR 语义（YOLO OR 传统，任一认为开就判开）
+    - YOLO 不可用：只能退回传统通道（此时没有更好的信息）
+    yolo_only 默认取 PANEL_FALLBACK_YOLO_ONLY，测试里可显式传参。
+    """
+    if yolo_only is None:
+        yolo_only = PANEL_FALLBACK_YOLO_ONLY
+    if not yolo_available:
+        return bool(traditional)
+    if yolo_only:
+        return bool(yolo_detected)
+    return bool(yolo_detected or traditional)
 
 
 def fuse_panel_verdict(hint_score, prev_open,
@@ -775,6 +1165,8 @@ def _ensure_panel_closed_for_send(det, sess, timeout=6.0, need=2, gap=0.15,
 SEND_KEEP_PANEL = os.environ.get("SKY_SEND_KEEP_PANEL", "1") != "0"
 # 发完是否补一下 ESC 退出输入框激活态（对齐上游 akinia；=0 关闭，走纯固定时序）
 SEND_EXIT_INPUT_ESC = os.environ.get("SKY_SEND_EXIT_INPUT_ESC", "1") != "0"
+# 动作（姿势/抱抱）后是否主动重开聊天面板（=0 关闭，回到只靠守门 1.2s 后重开）
+REOPEN_PANEL_AFTER_ACTION = os.environ.get("SKY_REOPEN_AFTER_ACTION", "1") != "0"
 
 
 def _send_msg(det, sess, msg, state) -> bool:
@@ -806,7 +1198,7 @@ def _send_msg(det, sess, msg, state) -> bool:
                                       "open_delay_ms": 260}, session=sess)
                     break
                 except RuntimeError as e:
-                    if "前台" in str(e) and i < 5:
+                    if ("前台" in str(e) or "foreground" in str(e).lower()) and i < 5:
                         if i == 0:
                             print("  [Action] 游戏不在前台，等回前台再发…")
                         time.sleep(5)
@@ -837,7 +1229,7 @@ def _send_msg(det, sess, msg, state) -> bool:
                                   "open_delay_ms": 340}, session=sess)
                 break
             except RuntimeError as e:
-                if "前台" in str(e) and i < 5:
+                if ("前台" in str(e) or "foreground" in str(e).lower()) and i < 5:
                     if i == 0:
                         print("  [Action] 游戏不在前台，等回前台再发…")
                     time.sleep(5)
@@ -976,13 +1368,22 @@ def _friend_tree_action(det, sess, state, act):
         time.sleep(0.4)
 
         def _press_f():
+            """对着好友树入口图标按 F：先过光翼安全窗（f_prompt_press_allowed），
+            被拒时返回 False 且**一个键都不按**（见第七十章 P0：open_tree_icon 与
+            wing_light 会在同一枚图标上摇摆，硬门那一拍未必亮）。"""
+            ok, why = f_prompt_press_allowed()
+            if not ok:
+                print(f"  [Guard] 拒绝按 F：{why} —— {act} 动作中止，未按任何键")
+                return False
             _key(sess, "f", 120)
+            return True
 
         # 首按前采一次"底噪"主动分（场景差异大：真机实测 0.08~0.57），供"相对增量"门限使用
         _sc_base, _ = det.friend_tree_score_now()
         if _sc_base is not None and _sc_base < 0:
             _sc_base = None
-        _press_f()
+        if not _press_f():
+            return False
         _last_f_t = time.time()
         _f_presses = 1
 
@@ -1015,7 +1416,8 @@ def _friend_tree_action(det, sess, state, act):
                 _f_presses += 1
                 print(f"  [Action] 第{_f_presses - 1}下F后{_nowt - _last_f_t:.1f}s仍无反应"
                       f"（主动分{_sc:.2f} 最高{_sc_max:.2f}、入口图标仍在），补按第{_f_presses}次F")
-                _press_f()
+                if not _press_f():
+                    break
                 _last_f_t = time.time()
             if _nowt - _last_dbg >= 0.5:
                 _last_dbg = _nowt
@@ -1300,12 +1702,14 @@ def _execute_reply(det, state, sess, reply):
             continue
         # 好友树互动动作（抱抱等）：检测入口图标→F→导航→空格→ESC
         if act in FRIEND_TREE_NAV:
-            _friend_tree_action(det, sess, state, act)
+            if _friend_tree_action(det, sess, state, act):
+                _reopen_panel_after_action(det, sess, state)
             continue
         # 姿势动作：智能切换，根据当前状态计算需要按几次3
         if act in POSE_ACTIONS:
             target_pose = POSE_ACTIONS[act]
             _do_pose_action(det, sess, state, target_pose, label=act)
+            _reopen_panel_after_action(det, sess, state)
             continue
 
         k = ACT_KEYS.get(act)
@@ -1447,6 +1851,18 @@ def fix(t):
     # 不成词的错误组合，绝不动单字“啥”（否则“干啥/做啥”会被误伤）；也不再做单字
     # “舍→啥”的全局替换——那会把本来认对的“宿舍/舍友”反而改错（2026-09-03 实机定位）。
     t = t.replace("宿啥", "宿舍").replace("啥友", "舍友").replace("华竟", "毕竟")
+    # ── 2026-10-15 真机实锤错字（均语境受限，不做单字全局替换，避免反向优化）──
+    # 语气词"哼"被认成"亨"：仅当"亨"在句首/标点后且紧跟语气标点时才改；
+    # 不动"大亨/亨利/亨通"等（它们"亨"在句中，或后面不跟语气标点）。
+    t = re.sub(r'(^|[\s，。！？!?…~～,])亨(?=[！!~～,，。…？?\s])', r'\1哼', t)
+    # 定向补一句首"亨星河"（"哼，星河自己说的"，"亨"后直接跟名字、无语气标点）
+    t = re.sub(r'(^|[\s，。！？!?…~～,])亨星河', r'\1哼星河', t)
+    # "好啦"被认成"子啦"（"子啦"不成词；"子"单字不碰，保护孩子/桌子/兔子）
+    t = t.replace("子啦", "好啦")
+    # 句末语气词"欸"(口+矣)被 OCR 按偏旁认成"俟"(亻+矣)/"埃"(土+矣)：
+    # 玩家说的是"雨林欸"。雨林俟/雨林埃→雨林欸；林俟/林埃（"雨"也漏识）→雨林欸。
+    # 交替长串优先，不产生雨雨林；只在"雨林"组合内纠，不碰尘埃/俟机等正常词。
+    t = re.sub(r'雨林[俟埃]|林[俟埃]', '雨林欸', t)
     return t
 
 
@@ -1773,7 +2189,7 @@ def read_chat_ocr(frame, ocr_engine, roi):
     best, best_score = [], -1
     early_counts = []  # 前两个变体(gray/sharp)的识别行数
     for name, im in variants:
-        result, _ = ocr_engine(im)
+        result, _ = ocr_infer(ocr_engine, im)
         result = result or []
         if result:
             confs = [float(r[2]) for r in result]
@@ -1843,7 +2259,7 @@ def _maybe_update_memory(state, llm_client, force=False):
         old_profile = state.memory.get("profile_prompt", "") or "暂无。"
         prompt = build_memory_update_prompt(state.memory, companion_name, old_profile)
         print("  [Memory] updating...")
-        result = llm_client.chat(prompt, temperature=0.2, max_tokens=520)
+        result = llm_client.chat(prompt, temperature=0.2, max_tokens=MEMORY_UPDATE_MAX_TOKENS)
         summary = clean_memory_summary(result)
         if len(summary) >= 20:
             state.memory = update_profile(state.memory, summary)
@@ -1885,16 +2301,481 @@ def _guard_should_reopen(snap, panel_state, panel_closed_since, t0,
     return True
 
 
+def _valid_name_text(text):
+    """OCR 读到的名字是否像“有效玩家名”：含汉字，或连续≥2个英文字母；
+    纯符号（? . 一 1）视为没读到，避免把噪点当陌生人名字。"""
+    if not text:
+        return False
+    t = str(text).strip()
+    if re.search(r"[一-鿿]", t):
+        return True
+    if re.search(r"[A-Za-z]{2,}", t):
+        return True
+    return False
+
+
+def _accept_decision(ft_open, ft_busy, name_wl, name_text, vlm_obj):
+    """纯决策（离线可单测）：互动邀请是否该按 F。阶段1只用于“模拟会不会按”打印，
+    阶段3自动执行时复用。策略遵循用户意愿：读不到名字默认接受（不连累漏掉），
+    但明确非白名单、或好友树开着、或传送/加入等危险界面时不按。"""
+    # 纯符号/单字母噪声当作“没读到名字”，避免误判成陌生人
+    if not _valid_name_text(name_text):
+        name_text = ""
+    if ft_open or ft_busy:
+        return False, "好友树开着/好友树动作中"
+    if name_text and not name_wl:
+        return False, f"名字OCR读到非白名单'{name_text}'"
+    if isinstance(vlm_obj, dict):
+        if vlm_obj.get("danger_ui") is True:
+            return False, "VLM判定为传送/加入/点火等危险界面"
+        inv = str(vlm_obj.get("inviter_name") or "").strip()
+        if (not name_text and inv and inv != "?"
+                and vlm_obj.get("is_whitelist_name") is False):
+            return False, f"VLM判定发起人非白名单'{inv}'"
+    return True, "白名单或读不到名字（按默认接受）"
+
+
+def _accept_vision_judge(frame, bbox):
+    """VLM 看一眼互动邀请（可用才调）：发起人名字、动作、是否危险界面。返回 dict 或 None。"""
+    if _vision is None or not getattr(_vision, "available", False) or frame is None:
+        return None
+    wl = "、".join(WHITELIST) if WHITELIST else "（未配置）"
+    q = (
+        "这是游戏《光·遇》画面。屏幕里可能有一个圆形的好友互动邀请图标（对方发起，"
+        "通常要按 F 接受），动作是：抱抱hug / 背背carry / 击掌high_five / 碰拳fist_bump。\n"
+        "请只返回 JSON、不要多余文字：\n"
+        '{"inviter_name":"邀请图标上方显示的玩家名字，看不到就填 ?",\n'
+        ' "is_whitelist_name": true或false,\n'
+        ' "invite_action":"hug/carry/high_five/fist_bump/none",\n'
+        ' "danger_ui": true或false,\n'
+        ' "note":"一句话说明"}\n'
+        f"is_whitelist_name：名字是否在白名单【{wl}】里；无法判断时填 false。\n"
+        "danger_ui：画面其实是【传送/加入房间、点火、开门、收光翼、先祖、神坛、星盘、"
+        "打开好友树】等其他带 F 的界面、而不是好友互动邀请时填 true。\n"
+        "判断名字时以角色头顶或邀请图标上方的中文名为唯一依据。"
+    )
+    return _vision.ask_json(frame, q, max_tokens=200)
+
+
+def _accept_invite_event(det, state, snap, frame, aname, cn, conf, bbox, t0, interact_q=None):
+    """一次确认的互动邀请事件：名字 OCR + 界面状态 + 可选 VLM，打印观测/执行日志。
+    阶段1（SKY_ACCEPT_AUTO=0）只打印、不按 F；阶段2（Delta B1）把事件喂 AI 先开口反应；
+    阶段3在这里接拟人执行（按 F）。"""
+    ft_open = bool(snap is not None and getattr(snap.friend_tree, "value", False))
+    ft_busy = bool(_friend_tree_busy)
+    try:
+        popen = panel_open(det)
+    except Exception:
+        popen = None
+    name_text = ""
+    name_wl = False
+    try:
+        name_text = (ocr_player_name_above_icon(frame, bbox) or "").strip()
+        name_wl = is_whitelist_player_name(name_text)
+    except Exception as e:
+        print(f"  [互动邀请] 名字OCR异常: {e}")
+    vlm_obj = None
+    try:
+        vlm_obj = _accept_vision_judge(frame, bbox)
+    except Exception as e:
+        print(f"  [互动邀请] VLM判断异常(已忽略): {e}")
+    would, reason = _accept_decision(ft_open, ft_busy, name_wl, name_text, vlm_obj)
+
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    vlm_txt = ""
+    if vlm_obj:
+        vlm_txt = (f" | VLM: 发起人={vlm_obj.get('inviter_name')} "
+                   f"白名单={vlm_obj.get('is_whitelist_name')} "
+                   f"动作={vlm_obj.get('invite_action')} 危险界面={vlm_obj.get('danger_ui')}")
+    else:
+        vlm_txt = " | VLM未启用(可用 SKY_VISION_ENABLED=1 开启，辅助判断发起人/危险界面)"
+    mode = "自动模式" if ACCEPT_AUTO else "观测模式(不按F)"
+    print(
+        f"  [互动邀请] [{mode}] {cn}({aname}) conf={conf:.2f} 框=({x1},{y1},{x2},{y2})"
+        f" | 名字OCR='{name_text or '?'}' 白名单={name_wl}"
+        f" | 好友树开={ft_open} 忙={ft_busy} 面板={popen}{vlm_txt}"
+    )
+    print(f"  [互动邀请] 模拟决策: {'会按F' if would else '不按F'} —— {reason}")
+
+    # Delta B1：只在“会接受”（白名单/默认接受）且开关开时，把邀请事件喂给 AI 先反应
+    # （先开口说话、不按 F）。陌生人 / 好友树开 / 危险界面（would=False）一律不喂。
+    if INTERACT_REACT_ENABLED and would and interact_q is not None:
+        try:
+            interact_q.put_nowait(interact_build_event(aname, cn, name_text, conf, t0))
+            print(f"  [互动反应] 已喂给AI：{cn}（先开口反应，不按 F）")
+        except queue.Full:
+            print("  [互动反应] 事件队列满，本次跳过")
+
+    # 阶段3：当 ACCEPT_AUTO 且 would 为真时，在此放入拟人执行（先台词/反应→延迟→按F）。
+    # 阶段1 不放任何按键，确保观测零风险。
+
+
+def _handle_accept_events(det, state, frame, t0, interact_q=None, action_q=None):
+    """好友互动邀请事件：连续帧防抖 + 冷却去重 + 图标持续时长统计。
+    在每次 YOLO 检测完成后调用（约 0.4s 一次，避免重复计同一帧）。
+    interact_q 非空时，确认的白名单邀请事件会入队（Delta B1 喂 AI 先反应）。
+    action_q 非空且 ACCEPT_AUTO 时，AI 卡住超 ACCEPT_FALLBACK_SECONDS 会投递兜底接受。"""
+    global _accept_seen, _accept_event_time, _accept_present, _accept_first_seen
+    global _accept_event_fed, _accept_miss, _accept_verdict
+    try:
+        snap = det.world.snapshot()
+    except Exception:
+        snap = None
+    for aname, cn in ACCEPT_CLASSES.values():
+        hit = _yolo_accept.get(aname)
+        present = hit is not None and float(hit[0]) >= ACCEPT_CONF
+        if present:
+            _accept_miss[aname] = 0
+            if not _accept_present[aname]:
+                _accept_present[aname] = True
+                _accept_first_seen[aname] = t0
+                _accept_seen[aname] = 1
+                _accept_event_fed[aname] = False
+                _accept_verdict[aname] = "pending"  # 阶段3：图标出现，等AI决策
+            else:
+                _accept_seen[aname] += 1
+        elif _accept_present[aname]:
+            # 图标在屏但这一拍没检测到：先累计漏检，未达宽限视为仍在（不重置、不触发）
+            _accept_miss[aname] += 1
+            if _accept_miss[aname] < ACCEPT_MISS_FRAMES:
+                continue
+            # 连续漏检达宽限，认定真消失
+            fs = _accept_first_seen.get(aname)
+            dur = (t0 - fs) if fs else 0.0
+            print(f"  [互动邀请] {cn}({aname}) 图标消失，持续约 {dur:.1f}s，"
+                  f"累计检测 {_accept_seen[aname]} 拍（持续时长用于判断AI决策来不来得及）")
+            _accept_present[aname] = False
+            _accept_first_seen[aname] = None
+            _accept_seen[aname] = 0
+            _accept_event_fed[aname] = False
+            _accept_miss[aname] = 0
+            _accept_verdict[aname] = None  # 阶段3：邀请消失，清决策
+            with state.lock:
+                state.pending_invites.pop(aname, None)  # AI 据此知道邀请已取消
+            continue
+        else:
+            continue
+        # 事件级去重：确认防抖后，本次 present 只喂一次（图标持续不重复，图标消失才重置）
+        if _accept_seen[aname] >= ACCEPT_CONFIRM_FRAMES and not _accept_event_fed[aname]:
+            _accept_event_fed[aname] = True
+            _accept_event_time[aname] = t0
+            conf, bbox = hit
+            with state.lock:
+                state.pending_invites[aname] = {"action_cn": cn, "first_seen": t0}
+            _accept_invite_event(det, state, snap, frame, aname, cn,
+                                 float(conf), bbox, t0, interact_q)
+        # 阶段3 兜底：事件已确认安全（喂给AI）、但 AI 一直没返回决策（verdict 仍 pending）
+        # 超过 ACCEPT_FALLBACK_SECONDS，自动按 F 接受（不说话、不再延迟）。
+        if (ACCEPT_AUTO and action_q is not None and _accept_event_fed[aname]
+                and _accept_verdict[aname] == "pending"
+                and _accept_first_seen[aname] is not None
+                and (t0 - _accept_first_seen[aname]) >= ACCEPT_FALLBACK_SECONDS):
+            print(f"  [阶段3] {cn}({aname}) AI 超过 {ACCEPT_FALLBACK_SECONDS:.0f}s 未决策，"
+                  f"兜底自动接受（不说话）")
+            _accept_verdict[aname] = "accept"
+            action_q.put_nowait(("accept_invite", aname, cn, "fallback"))
+
+
+# ===================== 拟人互动·阶段2（Delta B1）：邀请事件喂 AI 先反应 =====================
+# 设计（离线实测，见 _tmp/_react_result.txt）：
+#   - 动作类型【以 YOLO 为权威】（VLM 会把所有圆形 F 图标都判成 hug，8 张仅 2 对，不可信）；
+#   - 名字 OCR 把关白名单；只在“会接受”的邀请触发，陌生人不理；
+#   - 星河以人设先开口反应（台词），但 B1 绝不按 F（阶段3 才接受 + 15 秒兜底）。
+
+# 当 LLM 针对邀请产出回复时，B1 只允许它“开口说话”，绝不允许任何 [ACT]/[KEY]/[IDLE]
+# （B1 不按 F）。把回复强制清洗为纯 CHAT：有 CHAT 标签取第一句；裸文本（无任何标签）
+# 兜底包成 CHAT；若含 ACT/KEY/IDLE 标签（模型想发动作）或拿不到有效文字，一律返回 None。
+_INTERACT_NONCHAT_RE = re.compile(r'\[/?(?:ACT|KEY|IDLE)\]')
+
+
+def interact_sanitize_to_chat(reply):
+    if not reply:
+        return None
+    # 记忆 v4 保险：互动路径万一残留 RECALL 标签也剥掉，绝不让暗号出现在游戏输入框
+    reply = _RECALL_TAG_RE.sub("", reply)
+    chats = extract_chat_texts(reply)
+    if chats:
+        line = (chats[0] or "").strip()
+        return f"[CHAT]{line}[/CHAT]" if line else None
+    if _INTERACT_NONCHAT_RE.search(reply):
+        return None
+    bare = (reply or "").strip()
+    if len(bare) >= 2:
+        return f"[CHAT]{bare}[/CHAT]"
+    return None
+
+
+def interact_parse_decision(raw):
+    """阶段3（B2）：解析 AI 对邀请的决策。返回 (decision, line)：
+    decision = "accept"/"decline"/None；line=台词（可能为空，调用方用默认台词兜底）。
+    - 含 [ACCEPT] -> accept；含 [DECLINE] -> decline；两者都出现时 accept 优先（安全侧=不卡住）。
+    - 台词从 [CHAT] 取第一句。
+    """
+    if not raw:
+        return None, ""
+    has_accept = "[ACCEPT]" in raw
+    has_decline = "[DECLINE]" in raw
+    decision = "accept" if has_accept else ("decline" if has_decline else None)
+    texts = extract_chat_texts(raw)
+    line = texts[0] if texts else ""
+    return decision, line
+
+
+def interact_build_event(aname, cn, name_text, conf, t0):
+    """构造一个邀请事件（喂给 ai_loop 处理）。"""
+    return {
+        "action": aname,
+        "action_cn": cn,
+        "name": (name_text or "").strip(),
+        "conf": float(conf),
+        "time": float(t0),
+    }
+
+
+# LLM 拿不到有效台词时的硬兜底（每种动作一句，随时间轮换，避免重复）。
+INTERACT_DEFAULT_LINES = {
+    "抱抱": ["咦，怎么突然要抱我呀～", "哟，这是要抱我呀～"],
+    "背背": ["哟，怎么突然想背我了～", "咦，要背我呀～"],
+    "击掌": ["哟，来击掌呀～", "咦，要击掌～"],
+    "碰拳": ["哟，来碰个拳～", "咦，碰拳呀～"],
+    "熊抱": ["哟，这是要把我整个人抱住呀～", "咦，怎么突然来个熊抱～"],
+    "谢幕": ["哟，还跟我谢幕呢～", "咦，怎么突然演起来了～"],
+    "花式击掌": ["哟，这个击掌还挺花哨～", "咦，来个花式击掌呀～"],
+    "握手": ["哟，还挺正式，要握手呀～", "咦，怎么突然握手～"],
+    "摸头": ["哟，怎么突然摸我头～", "咦，摸我头干嘛呀～"],
+    "打闹": ["哟，怎么突然跟我闹起来了～", "咦，想跟我打闹呀～"],
+    "搭肩": ["哟，直接搭上来了～", "咦，怎么突然搭我肩膀～"],
+    "共舞": ["哟，这是要拉我跳舞呀～", "咦，怎么突然想共舞～"],
+    "耳语": ["哟，凑这么近要说什么呀～", "咦，有什么悄悄话～"],
+}
+
+
+def interact_default_line(cn, seed=0):
+    lines = INTERACT_DEFAULT_LINES.get(cn)
+    if not lines:
+        return "咦，怎么突然这么热情～"
+    try:
+        return lines[int(seed) % len(lines)]
+    except Exception:
+        return lines[0]
+
+
+def interact_invite_context(cn, who="", auto=False):
+    """邀请反应的 system 追加规则（约束台词自然、不油腻、不生硬）。
+
+    who=发起人名字（2026-10-19 修第六十三章 P1-2）：原来写死"珂珂"，但 SKY_WHITELIST 可配多人，
+    别的白名单好友发起时 AI 会叫错人（与 user 消息里的真实名字打架）。who 为空时用中性表述。
+    auto=阶段3（SKY_ACCEPT_AUTO=1）：让 AI 输出 [ACCEPT]/[DECLINE] 决策 + 台词；
+    auto=False（阶段2）：只输出 [CHAT]，不按 F。
+    """
+    who_txt = (who or "").strip() or "有好友"
+    base = (
+        "\n\n## 现在有一个好友互动邀请\n"
+        f"{who_txt}刚刚向你发起了【{cn}】。请你像平时一样，先自然地做出反应：\n"
+        "- 像平时一样自然地反应，主要是轻惊讶、随口问一句，比如“诶？怎么突然要抱抱呀？”。\n"
+        "- 你不是非得接受：你有拒绝的权利，也可以有小脾气；但这是你的自由而不是固定剧本，别刻意撒娇、别把“才不要～”当成套路。\n"
+        "- 用你平时说话的语气，口语化、简短自然，一次只说一两句话。\n"
+        "- 不要油腻、不要肉麻地堆甜言蜜语、不要说“抱完不许赖着不走”这种端着的话；也不要生硬客套。\n"
+    )
+    if auto:
+        # 阶段3：AI 自己决定接不接受
+        return base + (
+            "- 这次请你自己决定要不要接受，并在台词前加一个决策标签：\n"
+            "  · 愿意接受：输出 [ACCEPT][CHAT]你想说的话[/CHAT]（你会先说出这句话，停顿一下再按 F 接受）。\n"
+            "  · 想逗一下/暂时不想：输出 [DECLINE][CHAT]你想说的话[/CHAT]（只说话，不会按 F）。\n"
+            "- 对方是你信任的好友、没有危险时，通常倾向接受就好；拒绝留给你真的想逗一下或没心情的时候。\n"
+            "- 不要输出 [ACT]/[KEY]，接受这件事程序会根据 [ACCEPT] 标签替你按 F。\n"
+            "- 背景规则：如果你一直僵着不回应超过 15 秒，程序会自动帮你接受，所以别一直卡着。"
+        )
+    return base + (
+        "- 这一次只输出 [CHAT]你想说的话[/CHAT]，不要输出任何 [ACT]/[KEY]，程序不会替你按 F。\n"
+        "- 背景规则：如果你一直僵着不回应超过 15 秒，阶段3程序会自动帮你接受，所以别一直卡着。"
+    )
+
+
+def _handle_interact_event(det, state, action_q, llm_client, event):
+    """在 ai_loop 线程处理一个邀请事件：以星河人设生成反应台词；阶段3（ACCEPT_AUTO）
+    同时解析 AI 的 [ACCEPT]/[DECLINE] 决策，accept 时拟人执行按 F。
+    邀请事件不进长期记忆（只是个事件），只把台词记入 my_words 防重复。"""
+    global _accept_verdict
+    aname = event.get("action") or ""
+    cn = event.get("action_cn") or "抱抱"
+    name = (event.get("name") or "").strip()
+    who = (name + " ") if name else ""
+    system_parts = [SYSTEM]
+    if state.memory:
+        system_parts.append("## 长期记忆\n" + memory_prompt(state.memory))
+    system_parts.append(interact_invite_context(cn, name, auto=ACCEPT_AUTO))
+    messages = [{"role": "system", "content": "\n\n".join(system_parts)}]
+    # 最近对话窗口（让反应能接上上下文，而不是没头没脑地惊讶；2026-10-19 修"不顾上下文"）
+    with state.lock:
+        recent = list(state.conversation)[-6:]
+    if recent:
+        _role_zh = {"user": "玩家", "assistant": "你"}
+        recent_txt = "\n".join(
+            "%s：%s" % (_role_zh.get(m.get("role"), m.get("role")),
+                        str(m.get("content", ""))[:120])
+            for m in recent)
+        messages.append({"role": "system",
+                         "content": "## 邀请之前的最近对话（这是上下文，让你的反应能接上）\n"
+                                    + recent_txt})
+    user = (f"（系统事件，不是聊天）画面中{who}向你发起了【{cn}】邀请，"
+            "圆形互动图标已经出现。请结合上面的对话自然地反应。")
+    messages.append({"role": "user", "content": user})
+    raw = ""
+    try:
+        raw = llm_client.chat(messages, temperature=0.85, max_tokens=120)
+    except Exception as e:
+        print(f"  [互动反应] LLM异常: {e}")
+    # 解析决策与台词
+    decision = None
+    line = ""
+    if ACCEPT_AUTO:
+        decision, line = interact_parse_decision(raw)
+        if decision is None:
+            # AI 没给决策标签：白名单默认接受（不干等兜底），台词从回复里取
+            decision = "accept"
+            safe = interact_sanitize_to_chat(raw)
+            if safe:
+                t = extract_chat_texts(safe)
+                if t:
+                    line = t[0]
+    else:
+        safe = interact_sanitize_to_chat(raw)
+        if safe:
+            t = extract_chat_texts(safe)
+            if t:
+                line = t[0]
+    if not line:
+        line = interact_default_line(cn, seed=int(event.get("time", 0) or 0))
+    try:
+        line = polish_reply(line, recent_laugh_count(state.my_words))
+    except Exception:
+        pass
+    if not line:
+        line = interact_default_line(cn)
+    state.my_words.append(line)
+    if len(state.my_words) > 8:
+        state.my_words.pop(0)
+    # 兜底可能已在 AI 慢时把 verdict 改成 accept（并投了 fallback accept_invite）：
+    # 此时只发台词，不重复投 accept_invite（避免重复按 F）。
+    already_handling = ACCEPT_AUTO and _accept_verdict.get(aname) in ("accept", "done")
+    if ACCEPT_AUTO and not already_handling:
+        _accept_verdict[aname] = decision
+    print(f"  [互动反应] {cn} -> {line}（决策={decision or '仅说话'}）")
+    action_q.put(("execute", f"[CHAT]{line}[/CHAT]"))
+    if ACCEPT_AUTO and decision == "accept" and not already_handling:
+        action_q.put(("accept_invite", aname, cn, "normal"))
+
+
+# 预览窗口：类别中文名 + 框颜色（BGR），键是模型 class id
+_PREVIEW_CN = {0: "聊天框", 1: "牵手", 2: "好友树", 3: "抱抱", 4: "背背", 5: "击掌",
+               6: "碰拳", 7: "跟随", 8: "光翼", 9: "点火", 10: "聚焦", 11: "打坐",
+               12: "熊抱", 13: "谢幕", 14: "花式击掌", 15: "握手", 16: "摸头",
+               17: "互火", 18: "打闹", 19: "搭肩", 20: "共舞", 21: "耳语"}
+_PREVIEW_COLORS = {0: (170, 170, 170), 1: (0, 210, 0), 2: (255, 160, 0),
+                   3: (200, 0, 200), 4: (0, 150, 255), 5: (255, 200, 0),
+                   6: (60, 60, 255), 7: (255, 80, 180), 8: (0, 0, 255),
+                   9: (0, 180, 255), 10: (200, 200, 0), 11: (0, 220, 220),
+                   12: (180, 0, 120), 13: (128, 0, 128), 14: (0, 200, 100),
+                   15: (160, 120, 0), 16: (200, 100, 255), 17: (0, 100, 255),
+                   18: (0, 0, 180), 19: (100, 100, 100), 20: (255, 0, 128),
+                   21: (180, 200, 0)}
+
+
+def _draw_yolo_preview(det, now_t):
+    """在主线程每帧调用：实时游戏画面叠加最近一次 YOLO 检测框。
+    返回 False 表示用户按 q/关窗，要停止预览（不退出主程序）。"""
+    frame = det.latest_frame()
+    if frame is None:
+        return True
+    img = frame.copy()
+    h, w = img.shape[:2]
+    pil_ok = False
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        im = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        d = ImageDraw.Draw(im)
+        try:
+            font = ImageFont.truetype(r"C:\Windows\Fonts\msyh.ttc", max(20, int(h * 0.022)))
+        except Exception:
+            font = ImageFont.load_default()
+        for cls, conf, (x1, y1, x2, y2), name in _yolo_preview_boxes:
+            bgr = _PREVIEW_COLORS.get(cls, (255, 255, 255))
+            rgb = (bgr[2], bgr[1], bgr[0])
+            d.rectangle([x1, y1, x2, y2], outline=rgb, width=3)
+            label = f"{_PREVIEW_CN.get(cls, name)} {conf:.2f}"
+            tb = d.textbbox((x1, y1), label, font=font)
+            tw, th = tb[2] - tb[0], tb[3] - tb[1]
+            ly = max(0, int(y1) - th - 4)
+            d.rectangle([x1, ly, x1 + tw + 8, ly + th + 4], fill=rgb)
+            d.text((x1 + 4, ly + 1), label, fill=(255, 255, 255), font=font)
+        img = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
+        pil_ok = True
+    except Exception:
+        pil_ok = False
+    if not pil_ok:
+        for cls, conf, (x1, y1, x2, y2), name in _yolo_preview_boxes:
+            bgr = _PREVIEW_COLORS.get(cls, (255, 255, 255))
+            cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), bgr, 2)
+            cv2.putText(img, f"{name} {conf:.2f}", (int(x1), max(15, int(y1) - 6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
+    # 顶部 HUD（英文/数字，避免 cv2 中文乱码）
+    stale = now_t - _yolo_preview_time
+    mode = "AUTO" if ACCEPT_AUTO else "OBSERVE"
+    hud = (f"YOLO conf>={YOLO_CONF_THRESHOLD:.2f} | boxes:{len(_yolo_preview_boxes)} "
+           f"| last detect:{stale:.1f}s ago | accept:{mode} | q=close")
+    cv2.rectangle(img, (0, 0), (w, 34), (0, 0, 0), -1)
+    cv2.putText(img, hud, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.62,
+                (255, 255, 255), 2)
+    if YOLO_PREVIEW_SCALE and YOLO_PREVIEW_SCALE != 1.0:
+        img = cv2.resize(img, None, fx=YOLO_PREVIEW_SCALE, fy=YOLO_PREVIEW_SCALE)
+    cv2.imshow(_PREVIEW_WIN, img)
+    key = cv2.waitKey(30) & 0xFF
+    if key in (ord('q'), ord('Q'), 27):
+        return False
+    try:
+        if cv2.getWindowProperty(_PREVIEW_WIN, cv2.WND_PROP_VISIBLE) < 1:
+            return False
+    except Exception:
+        pass
+    return True
+
+
 def watch_loop(det: PanelDetector, state: SharedState,
-               ocr_q: queue.Queue, action_q: queue.Queue):
+               ocr_q: queue.Queue, action_q: queue.Queue, interact_q: queue.Queue):
     print("  [Watch] 线程启动")
     sess = _make_session()
     last_gray = None
+    _diag_suppressed = 0   # 仅诊断：本次触发前有多少拍"帧差超阈但没能投递"（OCR 忙/冷却中）
     panel_closed_since = None  # 面板首次被判为关的时刻，用于持续关迟滞
     roi = det.cfg.roi_chat
+    # 节拍实测（修 P1-7）：设计值 WATCH_INTERVAL=0.1s，但真机反推只有 ~1.05s/拍，
+    # 而所有"按拍计数"的安全参数（硬门防抖、邀请确认帧、消失宽限）都按 0.4s/拍算，
+    # 实际被拉长 2.6 倍。这里把真实节拍打出来，让偏差可见、可量化。
+    _cadence_t0 = time.time()
+    _cadence_n = 0
+    _cadence_print_at = time.time() + WATCH_CADENCE_LOG_EVERY
+    _frame_cache = [None]  # 本拍帧缓存：一拍内只拷一次 6.2MB 全帧（原每拍最多拷 3 次）
+
+    def _loop_frame():
+        if _frame_cache[0] is None:
+            _frame_cache[0] = det.latest_frame()
+        return _frame_cache[0]
 
     while not shutdown_event.is_set():
         t0 = time.time()
+        _frame_cache[0] = None
+        _cadence_n += 1
+        if t0 >= _cadence_print_at:
+            _elapsed = t0 - _cadence_t0
+            if _elapsed > 0 and _cadence_n > 1:
+                print("  [Watch] 节拍实测: %.2f 拍/秒（%.0fms/拍，设计值 %.0fms）"
+                      % (_cadence_n / _elapsed, _elapsed / _cadence_n * 1000.0,
+                         WATCH_INTERVAL * 1000.0))
+            _cadence_t0 = t0
+            _cadence_n = 0
+            _cadence_print_at = t0 + WATCH_CADENCE_LOG_EVERY
         try:
             snap = det.world.snapshot()
 
@@ -1920,27 +2801,34 @@ def watch_loop(det: PanelDetector, state: SharedState,
             # YOLO 检测牵手图标和聊天输入框（每隔 YOLO_DETECT_INTERVAL 秒检测一次）
             global _yolo_last_detect_time, _yolo_hand_detected, _yolo_hand_conf, _yolo_hand_bbox
             global _yolo_chat_input_detected, _yolo_chat_input_conf, _yolo_chat_input_bbox
-            global _yolo_open_tree_detected, _yolo_open_tree_conf
+            global _yolo_open_tree_detected, _yolo_open_tree_conf, _yolo_accept
+            global _yolo_preview_boxes, _yolo_preview_time
+            global _yolo_wing_light_seen, _yolo_wing_light_frames, _yolo_wing_light_last_seen
             if _yolo_model is not None and t0 - _yolo_last_detect_time > YOLO_DETECT_INTERVAL:
                 _yolo_last_detect_time = t0
-                frame = det.latest_frame()
+                frame = _loop_frame()   # 本拍共用一帧（原每拍最多拷 3 次 6.2MB 全帧）
                 if frame is not None:
                     try:
                         results = _yolo_model(frame, conf=YOLO_CONF_THRESHOLD, verbose=False)
                         found_hand = False
                         found_open_tree = False
                         found_chat_input = False
+                        found_wing_light = False
                         max_hand_conf = 0.0
                         max_open_tree_conf = 0.0
                         max_chat_input_conf = 0.0
+                        max_wing_conf = 0.0
                         best_hand_bbox = None
                         best_chat_input_bbox = None
+                        found_accept = {}  # action_name -> (conf, bbox)，取最高 conf
+                        preview_boxes = []  # 全部框，供预览窗口
                         if len(results[0].boxes) > 0:
                             for box in results[0].boxes:
                                 cls = int(box.cls[0])
                                 conf = float(box.conf[0])
                                 name = results[0].names[cls]
                                 x1, y1, x2, y2 = map(float, box.xyxy[0])
+                                preview_boxes.append((cls, conf, (x1, y1, x2, y2), name))
                                 if name == "hand_icon":
                                     found_hand = True
                                     if conf > max_hand_conf:
@@ -1949,6 +2837,14 @@ def watch_loop(det: PanelDetector, state: SharedState,
                                 elif name == "open_tree_icon":
                                     found_open_tree = True
                                     max_open_tree_conf = max(max_open_tree_conf, conf)
+                                elif name == WING_LIGHT_CLASS_NAME and conf >= WING_LIGHT_CONF:
+                                    # 光翼拾取图标（无翼绝不能按 F）：本拍标记，防抖/迟滞在检测后统一处理
+                                    found_wing_light = True
+                                    max_wing_conf = max(max_wing_conf, conf)
+                                elif cls in ACCEPT_CLASSES:
+                                    aname = ACCEPT_CLASSES[cls][0]
+                                    if aname not in found_accept or conf > found_accept[aname][0]:
+                                        found_accept[aname] = (conf, (x1, y1, x2, y2))
                                 elif name == "chat_input":
                                     # 位置约束：根据实测 chat_input 在 (0,712,728,818) 附近
                                     fh, fw = frame.shape[:2]
@@ -1970,6 +2866,20 @@ def watch_loop(det: PanelDetector, state: SharedState,
                         _yolo_chat_input_bbox = best_chat_input_bbox
                         _yolo_open_tree_detected = found_open_tree
                         _yolo_open_tree_conf = max_open_tree_conf
+                        _yolo_accept = found_accept
+                        _yolo_preview_boxes = preview_boxes
+                        _yolo_preview_time = t0
+                        # wing_light 光翼硬门：纯函数状态机推进一拍（防抖进入、迟滞退出）
+                        _prev_seen = _yolo_wing_light_seen
+                        _yolo_wing_light_seen, _yolo_wing_light_frames, _yolo_wing_light_last_seen = \
+                            wing_light_step(found_wing_light, t0, _yolo_wing_light_seen,
+                                            _yolo_wing_light_frames, _yolo_wing_light_last_seen)
+                        if _yolo_wing_light_seen and not _prev_seen:
+                            print("  [Guard] 附近检出光翼，进入防护：拦截 F（无翼保护，不拾取）")
+                        elif _prev_seen and not _yolo_wing_light_seen:
+                            print("  [Guard] 已离开光翼范围，解除 F 拦截")
+                        # 好友互动邀请事件（防抖/去重/OCR/VLM 观测；约0.4s一次）
+                        _handle_accept_events(det, state, frame, t0, interact_q, action_q)
                         if found_hand and DEBUG:
                             print(f"  [YOLO] 检测到牵手图标 置信度={max_hand_conf:.2f} 位置={best_hand_bbox}")
                         if found_open_tree and DEBUG:
@@ -2003,7 +2913,7 @@ def watch_loop(det: PanelDetector, state: SharedState,
                     name_ocr_text = ""
                     if NAME_OCR_ENABLED and _yolo_hand_detected and _yolo_hand_bbox is not None:
                         try:
-                            name_frame = det.latest_frame()
+                            name_frame = _loop_frame()
                             name_ocr_text = ocr_player_name_above_icon(name_frame, _yolo_hand_bbox)
                             if name_ocr_text:
                                 if is_whitelist_player_name(name_ocr_text):
@@ -2035,22 +2945,27 @@ def watch_loop(det: PanelDetector, state: SharedState,
                     print(f"  [Watch] 伸手了({detect_source})，按 F 牵住 → 进入牵手状态")
                     # 重置YOLO检测状态，避免重复按F
                     _yolo_hand_detected = False
-                    try:
-                        if panel_open(det) is True:
-                            _key(sess, "c", 150)
-                            time.sleep(0.25)
-                        _key(sess, "f", 120)
-                        # 只按一次，不连续按（避免打开好友树）
-                        time.sleep(1.0)
-                        # 牵手前按 C 关了面板，牵住后主动开回来（守门在 HOME 兜底受限，见 _open_panel）
-                        time.sleep(0.4)
-                        if panel_open(det) is not True:
-                            _key(sess, "c", 220)
-                            if not wait_panel(det, True, 2.0) and panel_open(det) is not True:
-                                time.sleep(0.5)
+                    # 光翼安全窗：牵手也是对着手伸图标按 F，与好友树入口同源风险
+                    _f_ok, _f_why = f_prompt_press_allowed()
+                    if not _f_ok:
+                        print(f"  [Guard] 拒绝按 F 牵手：{_f_why}（本次不牵，8 秒后再看）")
+                    else:
+                        try:
+                            if panel_open(det) is True:
+                                _key(sess, "c", 150)
+                                time.sleep(0.25)
+                            _key(sess, "f", 120)
+                            # 只按一次，不连续按（避免打开好友树）
+                            time.sleep(1.0)
+                            # 牵手前按 C 关了面板，牵住后主动开回来（守门在 HOME 兜底受限，见 _open_panel）
+                            time.sleep(0.4)
+                            if panel_open(det) is not True:
                                 _key(sess, "c", 220)
-                    except Exception as e:
-                        print(f"  [Watch] 牵手异常: {e}")
+                                if not wait_panel(det, True, 2.0) and panel_open(det) is not True:
+                                    time.sleep(0.5)
+                                    _key(sess, "c", 220)
+                        except Exception as e:
+                            print(f"  [Watch] 牵手异常: {e}")
 
             # 牵手状态超时重置（防止状态卡住）
             with state.lock:
@@ -2061,8 +2976,9 @@ def watch_loop(det: PanelDetector, state: SharedState,
             with state.lock:
                 last_ocr = state.last_chat_ocr_time
             if panel_open(det) is True and not MEM_READER_ENABLED:
-                frame = det.latest_frame()
+                frame = _loop_frame()
                 need = False
+                _diff = -1.0   # 仅诊断：本拍帧差；-1 表示没有可比上一帧（首帧/尺寸变化）
                 if frame is not None:
                     h, w = frame.shape[:2]
                     g = cv2.cvtColor(
@@ -2075,14 +2991,22 @@ def watch_loop(det: PanelDetector, state: SharedState,
                     else:
                         d = float(np.abs(g.astype(float)
                                          - last_gray.astype(float)).mean())
+                        _diff = d
                         need = d > 4.5
                     last_gray = g
                 if ocr_q.empty() and ((need and t0 - last_ocr > OCR_COOLDOWN) \
                         or t0 - last_ocr > OCR_FALLBACK):
+                    if OCR_DIAG:
+                        _why = "兜底" if not need else "帧差"
+                        print(f"  [OCRDiag] 触发 原因={_why} diff={_diff:.1f} "
+                              f"距上次={t0 - last_ocr:.1f}s 抑制={_diag_suppressed}")
+                    _diag_suppressed = 0
                     try:
                         ocr_q.put_nowait(("chat",))
                     except queue.Full:
                         pass
+                elif need:
+                    _diag_suppressed += 1
             else:
                 last_gray = None
                 # 持续关迟滞：必须连续 PANEL_REOPEN_DELAY 都判关才认为真关；
@@ -2158,6 +3082,28 @@ def _in_whitelist(name: str) -> bool:
     return False
 
 
+def _sender_name(msg: str) -> str:
+    """从 '[名字] 内容' 格式的消息里取发送者名字（取不到返回空串）。"""
+    m = _WHITELIST_NAME_RE.match(msg or "")
+    return m.group(1).strip() if m else ""
+
+
+# 记忆写入把关的可见化（2026-10-19 修第六十三章 P1-1）：
+# 非白名单消息不写长期记忆是**设计行为**，但若白名单配置漂移、或 OCR 出的名字变体匹配不上，
+# 星河的记忆会"静默停止更新"且完全无感。这里低频打印被跳过的发送者，让问题一眼可见。
+_MEM_SKIP_COUNT = 0
+
+
+def _log_memory_skip(name: str) -> None:
+    """被跳过的记忆写入计数 + 低频告警（第 1 条必打，之后每 10 条打一次）。"""
+    global _MEM_SKIP_COUNT
+    _MEM_SKIP_COUNT += 1
+    if _MEM_SKIP_COUNT == 1 or _MEM_SKIP_COUNT % 10 == 0:
+        who = (name or "").strip() or "未知(未解析到名字)"
+        print(f"  [Memory] 已跳过 {_MEM_SKIP_COUNT} 条非白名单消息不写入长期记忆"
+              f"（最近发送者={who}；若这是珂珂本人，说明白名单配置或名字识别有问题）")
+
+
 def _filter_by_whitelist(msgs: list[str]) -> list[str]:
     """过滤消息列表，只保留白名单玩家和AI自己的消息。
     白名单关闭时原样返回。"""
@@ -2225,7 +3171,7 @@ def ocr_player_name_above_icon(frame, bbox):
     gray_eq = clahe.apply(gray)
     # OCR 识别
     engine = _get_name_ocr_engine()
-    result, _ = engine(gray_eq)
+    result, _ = ocr_infer(engine, gray_eq)
     if not result:
         return ""
     texts = [str(r[1]).strip() for r in result if str(r[1]).strip()]
@@ -2243,6 +3189,7 @@ def is_whitelist_player_name(text):
 
 
 def _do_chat_ocr(det, state, ocr_engine, ai_q, voter=None):
+    global _ocr_diag_last_full
     frame = det.latest_frame()
     if frame is None:
         return
@@ -2259,6 +3206,15 @@ def _do_chat_ocr(det, state, ocr_engine, ai_q, voter=None):
     text = ocr_str(items)
     if DEBUG and text:
         print(f"  [OCR] {text.replace(chr(10), ' | ')[:160]}")
+    if OCR_DIAG:
+        # P0 插桩：用【完整文本】判断是否真的变了（上面日志那条是 [:160] 截断的，
+        # 新消息追加在底部，前 160 字符可能完全不变，不能当签名）；底部 1~2 行原文
+        # 用于人工分辨"真新消息"还是"同一段历史的重复识别"。
+        _full = text or ""
+        _changed = 0 if _full == _ocr_diag_last_full else 1
+        _bottom = [ln.strip() for ln in _full.splitlines() if ln.strip()][-2:]
+        print(f"  [OCRDiag] 行数={len(items)} 全文变={_changed} 底部=" + " | ".join(_bottom))
+        _ocr_diag_last_full = _full
 
     now = time.time()
     with state.lock:
@@ -2348,15 +3304,29 @@ def _do_chat_ocr(det, state, ocr_engine, ai_q, voter=None):
         try:
             ai_q.put_nowait((msgs, priority))
         except queue.Full:
-            pass
+            # 2026-10-19 修第六十三章 P2-1：丢玩家消息不能静默，至少留下痕迹
+            print(f"  [AI-Q] 队列仍满，丢弃本批消息: {(' | '.join(msgs[-2:]))[:80]}")
 
 # ===================== AiThread（重写：集成记忆/搜索/风格/防重复/打磨） =====================
 
 def ai_loop(det, state: SharedState, ai_q: queue.Queue,
-            action_q: queue.Queue, llm_client: LLMClient):
+            action_q: queue.Queue, llm_client: LLMClient,
+            interact_q: queue.Queue):
     print("  [AI] 线程启动（sky-companion 聊天引擎）")
 
     while not shutdown_event.is_set():
+        # Delta B1：优先处理好友互动邀请事件（先开口反应，不按 F），不与玩家消息抢
+        try:
+            interact_event = interact_q.get_nowait()
+        except queue.Empty:
+            interact_event = None
+        if interact_event is not None:
+            try:
+                _handle_interact_event(det, state, action_q, llm_client, interact_event)
+            except Exception as e:
+                print(f"  [互动反应] 处理异常: {e}")
+            continue
+
         try:
             msgs, priority = ai_q.get(timeout=1.0)
         except queue.Empty:
@@ -2365,12 +3335,17 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
         try:
             # ── 1. 提取最新玩家消息（过滤自己的消息） ──
             player_msg = ""
+            player_raw = ""
             for m in reversed(msgs):
                 if not _is_self_msg(m):
+                    player_raw = m
                     player_msg = _NAME_PREFIX_RE.sub("", m, count=1).strip()
                     break
             if not player_msg:
                 continue
+            # 记忆写入把关（2026-10-19）：只有白名单玩家（或白名单关闭）的话
+            # 才进长期记忆，防止路人的话被整理器当成珂珂的事写进 profile。
+            mem_recordable = _in_whitelist(_sender_name(player_raw))
 
             # ── 2. 联网搜索判断 ──
             search_context = ""
@@ -2431,8 +3406,74 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             system_with_memory += "\n\n## 长期记忆\n" + memory_prompt(state.memory)
             if style_context:
                 system_with_memory += "\n\n## 说话风格参考\n" + style_context
+            # 珂珂真实说话习惯画像（从 raw_turns 统计，纯本地；2026-10-19 新增）
+            player_style = player_style_profile(state.memory.get("raw_turns", []))
+            if player_style:
+                system_with_memory += "\n\n## 珂珂的说话习惯（贴合TA的节奏接话，不是模仿TA）\n" + player_style
             if learned_search:
                 system_with_memory += "\n\n## 已学到的联网知识\n" + learned_search
+            # ── 记忆 v4：事件日记（四层检索的注入侧） ──
+            _diary_have = bool(diary_recent(1))
+            if _diary_have:
+                # ① 默认层：最近几条日记 → 时间感（零检索成本）
+                _dr = diary_recent(DIARY_INJECT_RECENT)
+                if _dr:
+                    system_with_memory += ("\n\n## 我们的记忆日记（最近发生的事）\n"
+                                           + "\n".join(f"- {d['time']} {d['event']}" for d in _dr))
+                # ② 触发层：这条消息命中回忆触发词 → 本地检索旧日记
+                if player_msg and any(w in player_msg for w in RECALL_TRIGGER_WORDS):
+                    _dh = diary_recall(player_msg)
+                    if _dh:
+                        system_with_memory += ("\n\n## 相关往日记忆（珂珂提到了过去的事）\n"
+                                               + "\n".join(f"- {i['time']} {i['event']}" for _, i in _dh))
+                        print(f"  [Diary] 回忆触发词命中，注入 {len(_dh)} 条旧日记")
+                # ④ 协议层：RECALL 暗号说明（日记非空才教它，免得空转）
+                system_with_memory += (
+                    "\n\n## 回忆协议\n你有一本事件日记，还有周记/月记/年记"
+                    "（上面注入的就是节选）。\n"
+                    "当珂珂的问题涉及过去的人、事、约定或某个时间段，而你现有记忆里"
+                    "没有足够答案时，先在回复的最开头输出"
+                    " [RECALL]关键词[/RECALL]（例：[RECALL]犬夜叉[/RECALL]），"
+                    "系统会同时检索事件日记和周/月/年记，再让你基于记忆重新回答。\n"
+                    "关键词取问题里最具体、最可能被记下来的词（人名、地点、事件、话题）；"
+                    "能直接答就别用，只在真的需要回忆且现有记忆不够时才用，"
+                    "平时正常聊天绝不使用。"
+                )
+
+            # ── 记忆 v5：分层记忆（周记常驻 + 周/月/年触发检索） ──
+            _wr = weekly_recent(1)
+            if _wr:
+                w = _wr[0]
+                system_with_memory += (
+                    "\n\n## 周记（最近一周我们的日子，保持这周在干嘛的连续感）\n"
+                    f"- {w.get('period', '')}（{w.get('start', '')}~{w.get('end', '')}）："
+                    f"{w.get('text', '')}"
+                )
+            if player_msg:
+                if any(x in player_msg for x in WEEKLY_RECALL_WORDS):
+                    _sh = summary_recall(player_msg, levels=("weekly",))
+                    if _sh:
+                        system_with_memory += (
+                            "\n\n## 相关周记（珂珂提到了某一周）\n"
+                            + "\n".join(f"- {it.get('period', '')}：{it.get('text', '')}"
+                                        for _, _, it in _sh))
+                        print(f"  [Summary] 周记触发，注入 {len(_sh)} 篇")
+                elif any(x in player_msg for x in MONTHLY_RECALL_WORDS):
+                    _sh = summary_recall(player_msg, levels=("monthly", "weekly"))
+                    if _sh:
+                        system_with_memory += (
+                            "\n\n## 相关月记（珂珂提到了某个月）\n"
+                            + "\n".join(f"- {it.get('period', '')}：{it.get('text', '')}"
+                                        for _, _, it in _sh))
+                        print(f"  [Summary] 月记触发，注入 {len(_sh)} 篇")
+                elif any(x in player_msg for x in YEARLY_RECALL_WORDS):
+                    _sh = summary_recall(player_msg, levels=("yearly", "monthly"))
+                    if _sh:
+                        system_with_memory += (
+                            "\n\n## 相关年记（珂珂提到了某一年）\n"
+                            + "\n".join(f"- {it.get('period', '')}：{it.get('text', '')}"
+                                        for _, _, it in _sh))
+                        print(f"  [Summary] 年记触发，注入 {len(_sh)} 篇")
 
             # ── 本地知识库：游戏常识（纯本地、零风险） ──
             if knowledge is not None:
@@ -2480,6 +3521,18 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             if gohome_done:
                 system_with_memory += "\n\n## 刚刚发生的事\n你刚刚成功执行了回遇境，现在已经在遇境了。请自然地提到这件事（比如'终于回来了''到遇境啦'），不要太刻意。"
 
+            # 待处理邀请状态注入：图标持续在屏时，让 AI 知道邀请还在等待（玩家可能在催/聊这件事）
+            with state.lock:
+                pending_now = [v.get("action_cn") for k, v in state.pending_invites.items()]
+            pending_now = [x for x in pending_now if x]
+            if pending_now:
+                _acts = "、".join(pending_now)
+                system_with_memory += (
+                    f"\n\n## 当前有一个待处理的互动邀请\n屏幕上【{_acts}】的邀请图标还在，"
+                    "你之前已经对它反应过了（不要重复“怎么突然…”的惊讶）。玩家现在可能正在和你聊这件事、或催你；"
+                    "自然地接上对话即可，比如同意就说“好，抱你”之类。你可以在心里决定接不接受，但现在不能自己按 F"
+                    "（要等阶段3程序执行），这一步也不要输出任何动作标签。")
+
             # 视觉不再做“固定触发词预识别”：改为在第7步注册 look_at_screen 工具，
             # 由模型自己判断何时看画面（场景/姿势/前方物体/图标都能问）。
 
@@ -2499,13 +3552,23 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             ts = time.strftime("%H:%M:%S")
             print(f"\n[{ts}] {' | '.join(msgs[-3:])[:80]}")
 
+            # 2026-10-19 修第六十五章 P0：trim() 内部会同步调 LLM（超时 30s、最多重试 1 次），
+            # 原来放在 state.lock 里执行 → 最坏约 60 秒全程持锁，watch/action/主线程全部阻塞
+            # （表现为"星河突然发呆几十秒"且日志里没有任何原因）。
+            # state.conversation 只有 ai_loop 写（本处 + 下方追加 assistant），无跨线程竞争，
+            # 所以锁只用来做快照，LLM 压缩放到锁外执行 —— 不影响光翼硬门等任何安全逻辑。
             with state.lock:
                 state.conversation.append({"role": "user", "content": content})
-                state.conversation = trim(state.conversation, llm_client)
+                conv_now = list(state.conversation)
+            conv_now = trim(conv_now, llm_client)          # 锁外：可能耗时数十秒
+            with state.lock:
+                state.conversation = conv_now
                 conv_snapshot = (
                     [{"role": "system", "content": system_with_memory}]
                     + list(state.conversation)
                 )
+            # 记忆 v4：对话窗口持久化（锁外保存，重启接着聊）
+            _save_conversation(conv_now)
 
             if AI_TRACE_ENABLED:
                 _ai_trace_write(
@@ -2599,6 +3662,9 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             reply = msg.get("content") or ""
             _llm_dt = time.time() - _t_llm
             print(f'  [AI] LLM耗时 {_llm_dt:.1f}s')
+
+            reply, _used_rc = _apply_recall_protocol(
+                reply, work_messages, state, llm_client, player_msg)
             if AI_TRACE_ENABLED:
                 try:
                     _raw_dump = json.dumps(
@@ -2618,14 +3684,19 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
 
             with state.lock:
                 state.conversation.append({"role": "assistant", "content": reply})
+                _conv_for_save = list(state.conversation)
+            _save_conversation(_conv_for_save)  # 记忆 v4：持久化（锁外）
 
             # ── 8. 回复处理（打磨/防重复/重写/兜底） ──
             if "[IDLE]" in reply:
                 print("  [AI] (idle)")
                 if AI_TRACE_ENABLED:
                     _ai_trace_write("---- 程序最终处理 ----\n判定=IDLE，本轮不回复（模型认为无需开口）")
-                state.memory = add_turn(state.memory, player_msg, "")
-                _maybe_update_memory(state, llm_client)
+                if mem_recordable:
+                    state.memory = add_turn(state.memory, player_msg, "")
+                    _maybe_update_memory(state, llm_client)
+                else:
+                    _log_memory_skip(_sender_name(player_raw))
                 continue
 
             # 协议宽容兜底：模型完全裸输出纯文本（无任何协议标签）时自动补 [CHAT]，
@@ -2675,17 +3746,17 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
                     if len(state.my_words) > 8:
                         state.my_words.pop(0)
 
-            # ── 9. 记入记忆 ──
-            state.memory = add_turn(state.memory, player_msg, chat_text)
-
-            # ── 10. 触发记忆整理 ──
-            _maybe_update_memory(state, llm_client)
-
-            # ── 11. 放入 action_q ──
+            # ── 9. 先把回复发出去（2026-10-19 顺序调整：原来 add_turn/记忆整理
+            #    阻塞在 action_q.put 前面，整合要花 1~3 秒，玩家会感觉星河卡一下） ──
             if "[IDLE]" in reply:
                 print("  [AI] (idle after processing)")
                 if AI_TRACE_ENABLED:
                     _ai_trace_write("---- 程序最终处理 ----\n判定=IDLE（防重复/兜底后认为不必回复）")
+                if mem_recordable:
+                    state.memory = add_turn(state.memory, player_msg, "")
+                    _maybe_update_memory(state, llm_client)
+                else:
+                    _log_memory_skip(_sender_name(player_raw))
                 continue
             print(f"  [AI] -> {reply[:120]}")
             if AI_TRACE_ENABLED:
@@ -2693,6 +3764,14 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
                     "---- 程序最终处理 ----\n判定=发送\n最终发出CHAT=%s\n---- reply标签全文 ----\n%s"
                     % (chat_text, reply))
             action_q.put(("execute", reply))
+
+            # ── 10. 发完再记入记忆 / 触发记忆整理（仅白名单玩家，
+            #     防路人消息污染长期记忆；2026-10-19） ──
+            if mem_recordable:
+                state.memory = add_turn(state.memory, player_msg, chat_text)
+                _maybe_update_memory(state, llm_client)
+            else:
+                _log_memory_skip(_sender_name(player_raw))
 
         except Exception as e:
             print(f"  [AI] 异常: {e}")
@@ -2730,13 +3809,52 @@ def action_loop(det: PanelDetector, state: SharedState,
                 if snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand"):
                     print("  [Action] 图标还在，再按一次 F")
                     _key(sess, "f", 120)
+            elif cmd[0] == "accept_invite":
+                # 阶段3：拟人接受好友互动邀请。normal=先发台词后延迟2s；fallback=兜底不延迟。
+                _, aname, cn, reason = cmd
+                if reason == "normal":
+                    time.sleep(ACCEPT_PRESS_DELAY)
+                # 复查邀请图标还在（用户中途取消就不按）
+                if not _accept_present.get(aname):
+                    print(f"  [阶段3] {cn} 邀请已消失（可能被取消），不按 F")
+                    _accept_verdict[aname] = None
+                else:
+                    ok, why = f_prompt_press_allowed()  # 过光翼安全窗
+                    if not ok:
+                        print(f"  [Guard] 拒绝按 F：{why} —— {cn} 接受中止，未按任何键")
+                        _accept_verdict[aname] = None
+                    else:
+                        # 台词已发出（execute 已完成），按 F 前先关聊天面板（面板开着时
+                        # F 可能被输入拦截；与牵手/好友树动作一致）
+                        _close_panel(det, sess)
+                        # 关面板后再复查一次图标（按 C 期间用户可能取消）
+                        if not _accept_present.get(aname):
+                            print(f"  [阶段3] {cn} 关面板后邀请消失，不按 F")
+                            _accept_verdict[aname] = None
+                        else:
+                            print(f"  [阶段3] {cn} 按 F 接受")
+                            _key(sess, "f", 120)
+                            # 确认图标消失（最多等2s，YOLO 需要1-2拍更新）
+                            gone = False
+                            _deadline = time.time() + 2.0
+                            while time.time() < _deadline and not shutdown_event.is_set():
+                                if not _accept_present.get(aname):
+                                    gone = True
+                                    break
+                                time.sleep(0.2)
+                            if not gone:
+                                print(f"  [阶段3] {cn} 图标还在，补按一次 F")
+                                _key(sess, "f", 120)
+                                time.sleep(0.8)
+                            _accept_verdict[aname] = "done"
+                            print(f"  [阶段3] {cn} 接受完成")
             elif cmd[0] == "reopen":
                 try:
                     det.dump_evidence("reopen")
                     if _open_panel(det, sess, state):
                         print("  [Action] 面板已按开（守门）")
                 except RuntimeError as e:
-                    if "前台" not in str(e):
+                    if "前台" not in str(e) and "foreground" not in str(e).lower():
                         raise
         except Exception as e:
             print(f"  [Action] 异常: {e}")
@@ -2860,6 +3978,12 @@ def setup_run_log():
             WHITE_MASK_VMIN, WHITE_MASK_SMAX))
         print("云端视觉VLM=%s 可用=%s 模型=%s | 姿势校验=%s" % (
             VISION_ENABLED, _vision.available, _vision.model, VISION_POSE_CHECK))
+        print("互动邀请 accept=%s 阈值=%.2f 连续帧=%d 冷却=%.0fs（%s）" % (
+            "自动按F" if ACCEPT_AUTO else "仅观测",
+            ACCEPT_CONF, ACCEPT_CONFIRM_FRAMES, ACCEPT_COOLDOWN,
+            "会自动接受" if ACCEPT_AUTO else "不按F，只打[互动邀请]日志"))
+        print("YOLO预览窗口=%s（SKY_YOLO_PREVIEW=1 开启，可看识别框）" % (
+            "开" if YOLO_PREVIEW else "关"))
         print("=" * 60)
 
         # 滚动：只保留最近 LOG_KEEP 个 loop_*.txt（按修改时间倒序）
@@ -2967,6 +4091,22 @@ def main():
     print(f"  聊天输入: {'内存读取' if MEM_READER_ENABLED else 'OCR截图'}")
     print("=" * 40)
 
+    # 0. 分层记忆补压缩（启动时检查：已结束的周/月/年没总结就补；低频、游戏外）
+    if SUMMARY_ON_STARTUP:
+        try:
+            due = due_periods()
+            n_due = len(due["weekly"]) + len(due["monthly"]) + len(due["yearly"])
+            if n_due:
+                print(f"[Summary] 发现 {n_due} 个待补总结（周{len(due['weekly'])} "
+                      f"月{len(due['monthly'])} 年{len(due['yearly'])}），开始压缩…")
+                added = summarize_due_periods(llm_client, companion_name="星河")
+                print(f"[Summary] 完成：周记+{added['weekly']} 月记+{added['monthly']} "
+                      f"年记+{added['yearly']}")
+            else:
+                print("[Summary] 分层记忆无缺口")
+        except Exception as e:
+            print(f"[Summary] 启动压缩失败（不影响主流程）: {e}")
+
     # 1. 定位游戏窗口
     region = find_game_client_region(DetectorConfig.window_titles)
     if region:
@@ -3010,7 +4150,7 @@ def main():
     det.world.on_change = on_change
 
     # 3.5 加载 YOLO 模型（可选）
-    global _yolo_model
+    global _yolo_model, _wing_light_guard_online
     if YOLO_ENABLED:
         try:
             from ultralytics import YOLO
@@ -3018,6 +4158,17 @@ def main():
                 _yolo_model = YOLO(YOLO_MODEL_PATH)
                 print(f"  [YOLO] 模型加载成功: {os.path.basename(YOLO_MODEL_PATH)}")
                 print(f"  [YOLO] 置信度阈值: {YOLO_CONF_THRESHOLD}")
+                # 光翼硬门可见性（修 P0-3）：模型里没有 wing_light 类 = 硬门根本不会亮。
+                # 例如回退旧 7 类 sky_v4_7cls（无该类）时，此前是完全静默的。
+                try:
+                    _names = set((_yolo_model.names or {}).values())
+                    _wing_light_guard_online = WING_LIGHT_CLASS_NAME in _names
+                except Exception:
+                    _wing_light_guard_online = False
+                if not _wing_light_guard_online:
+                    print("  [Guard] ⚠ 该模型没有光翼类（wing_light），光翼硬门实际未生效！"
+                          f"（当前查找的类名='{WING_LIGHT_CLASS_NAME}'，"
+                          "换模型后可用 SKY_WING_LIGHT_CLASS_NAME 对齐）")
             else:
                 print(f"  [YOLO] 模型文件不存在: {YOLO_MODEL_PATH}")
                 print("  [YOLO] 将使用模板匹配检测牵手图标")
@@ -3029,10 +4180,33 @@ def main():
             print(f"  [YOLO] 加载失败: {e}，使用模板匹配")
             _yolo_model = None
 
+    # 3.6 光翼硬门状态可见性（修 P0-3）：以前硬门失效是**完全静默**的，回退旧 7 类模型
+    # （无 wing_light 类）后用户会以为还在保护。这里启动必打一行，说清到底在不在。
+    if not WING_LIGHT_GUARD_ENABLED:
+        _guard_desc = "已手动关闭（SKY_WING_LIGHT_GUARD=0）"
+    elif _wing_light_guard_online:
+        _guard_desc = "生效"
+    else:
+        _guard_desc = "未生效（YOLO 不可用或模型无光翼类）"
+    print("光翼硬门=%s | UI提示F安全窗=%.0fs（最近见过光翼则禁止对着F提示按）" % (
+        _guard_desc, WING_LIGHT_F_SAFE_WINDOW))
+    if WING_LIGHT_GUARD_ENABLED and not _wing_light_guard_online and not F_ALLOW_WITHOUT_GUARD:
+        print("  [Guard] ⚠ 硬门未生效期间：好友树/牵手类动作不会按 F（fail-safe，宁可不抱）；"
+              "确认环境安全可设 SKY_F_ALLOW_WITHOUT_GUARD=1 放行")
+    # 阈值名不副实的坑（P1-1）：低于推理阈值的框根本不会出现在结果里，类内二次过滤形同虚设
+    if WING_LIGHT_CONF < YOLO_CONF_THRESHOLD:
+        print("  [Guard] 提示：SKY_WING_LIGHT_CONF=%.2f < SKY_YOLO_CONF=%.2f，"
+              "实际生效阈值=后者（推理时就已滤掉低置信框）。想放宽光翼检出请调低 SKY_YOLO_CONF。"
+              % (WING_LIGHT_CONF, YOLO_CONF_THRESHOLD))
+    if ACCEPT_CONF < YOLO_CONF_THRESHOLD:
+        print("  [互动邀请] 提示：SKY_ACCEPT_CONF=%.2f < SKY_YOLO_CONF=%.2f，同上被后者卡住。"
+              % (ACCEPT_CONF, YOLO_CONF_THRESHOLD))
+
     state = SharedState()
     ocr_q = queue.Queue(maxsize=2)
     ai_q = queue.Queue(maxsize=1)
     action_q = queue.Queue(maxsize=8)
+    interact_q = queue.Queue(maxsize=8)  # Delta B1：好友互动邀请事件（watch 投递，ai 优先处理）
 
     # 内存读取回调：把消息放入AI队列
     mem_reader = None
@@ -3084,9 +4258,9 @@ def main():
         print("  [MemReader] 内存聊天读取已启用（跳过OCR聊天识别）")
 
     threads = [
-        threading.Thread(target=watch_loop, args=(det, state, ocr_q, action_q),
+        threading.Thread(target=watch_loop, args=(det, state, ocr_q, action_q, interact_q),
                          name="Watch", daemon=True),
-        threading.Thread(target=ai_loop, args=(det, state, ai_q, action_q, llm_client),
+        threading.Thread(target=ai_loop, args=(det, state, ai_q, action_q, llm_client, interact_q),
                          name="AI", daemon=True),
         threading.Thread(target=action_loop, args=(det, state, action_q),
                          name="Action", daemon=True),
@@ -3101,10 +4275,33 @@ def main():
     print("Ctrl+C 退出")
     print("=" * 40)
 
+    preview_on = YOLO_PREVIEW
+    if preview_on:
+        print("  [YOLO预览] 实时窗口已开启：窗口内按 q 或点右上角 × 关闭预览（不影响主程序）")
+    last_dbg = 0.0
+
+    def _close_preview():
+        try:
+            cv2.destroyWindow(_PREVIEW_WIN)
+        except Exception:
+            pass
+
     try:
         while True:
-            time.sleep(2.0)
-            if DEBUG:
+            if preview_on:
+                try:
+                    if not _draw_yolo_preview(det, time.time()):
+                        preview_on = False
+                        _close_preview()
+                        print("  [YOLO预览] 预览窗口已关闭，主程序继续运行")
+                except Exception as e:
+                    preview_on = False
+                    _close_preview()
+                    print("  [YOLO预览] 绘制异常(已关闭预览):", e)
+            else:
+                time.sleep(2.0)
+            if DEBUG and time.time() - last_dbg >= 2.0:
+                last_dbg = time.time()
                 snap_d = det.world.snapshot()
                 desc = snap_d.describe()
                 # hint_bar 主裁分（实机验证三态判据的关键观测点）
@@ -3132,6 +4329,10 @@ def main():
         for t in threads:
             t.join(timeout=3.0)
         det.stop()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
         print("已退出")
 
 

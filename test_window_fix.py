@@ -116,7 +116,74 @@ check("只解析参数不碰窗口（平台不符或参数先失败都返回 1�
       wf.main(["--size", "abc"]) == 1)
 
 print()
-print("H. 本模块源码 GBK 安全（Windows 控制台/管道不会崩）")
+print("H. explain_win32_error（SetWindowPos 失败时的诊断文案）")
+
+check("错误表收录了最常见的几个码",
+      {5, 6, 87, 1400, 1401} <= set(wf.WIN32_ERRORS))
+e5 = wf.explain_win32_error(5)
+check("5 = 拒绝访问", "拒绝访问" in e5)
+check("5 的提示里含「管理员」（2026-10-06 真机踩到的就是这个）",
+      "管理员" in e5)
+check("6 = 无效句柄", "无效句柄" in wf.explain_win32_error(6))
+check("87 = 参数错误", "参数错误" in wf.explain_win32_error(87))
+check("1400 = 无效的窗口句柄", "无效的窗口句柄" in wf.explain_win32_error(1400))
+e0 = wf.explain_win32_error(0)
+check("0 = 取不到错误码（明确说明，不假装成功）", "取不到错误码" in e0)
+eu = wf.explain_win32_error(12345)
+check("未知码也带上原码", "12345" in eu)
+check("未知码标明未收录", "未收录" in eu)
+check("错误码文案一律带「Win32 错误 N」前缀",
+      all(wf.explain_win32_error(c).startswith("Win32 错误 %d：" % c)
+          for c in (0, 5, 6, 87, 1400, 1401, 99999)))
+
+print()
+print("I. apply_resize 的三种策略名（只验常量，不真调 Win32）")
+
+check("源码里有三种候选写法", all(k in open(wf.__file__, "rb").read().decode("utf-8")
+                                  for k in ("SetWindowPos(不激活不置顶)",
+                                            "SetWindowPos(允许激活)", "MoveWindow")))
+check("SWP 常量没写错", (wf.SWP_NOZORDER, wf.SWP_NOACTIVATE) == (0x0004, 0x0010))
+check("恢复常量没写错", wf.SW_RESTORE == 9)
+
+print()
+print("J. offscreen_px / fully_visible（客户区是否被切边）")
+
+# 双屏：左屏 -1920..0，右屏 0..1920 -> 虚拟屏幕 (-1920, 0, 3840, 1080)
+DUAL = (-1920, 0, 3840, 1080)
+SINGLE = (0, 0, 1920, 1080)
+
+check("铺满左屏 @(-1920,0) -> 完整可见",
+      wf.offscreen_px(-1920, 0, 1920, 1080, DUAL) == (0, 0))
+check("铺满单屏 @(0,0) -> 完整可见",
+      wf.offscreen_px(0, 0, 1920, 1080, SINGLE) == (0, 0))
+check("正好贴住右下边界 -> 完整可见（不算超出）",
+      wf.offscreen_px(0, 0, 1920, 1080, SINGLE) == (0, 0))
+check("真机那种 @(231,92) + 1920x1080 -> 超右 231、超下 92",
+      wf.offscreen_px(231, 92, 1920, 1080, DUAL) == (231, 92))
+check("往左出屏 -> 横向超出",
+      wf.offscreen_px(-3000, 0, 1920, 1080, DUAL) == (1080, 0))
+check("往上出屏 -> 纵向超出",
+      wf.offscreen_px(0, -200, 1920, 1080, DUAL) == (0, 200))
+check("两边都出 -> 横向相加（左 80 + 右 280；虚拟屏右边界 = -1920+3840 = 1920）",
+      wf.offscreen_px(-2000, 0, 4200, 1080, DUAL) == (80 + 280, 0))
+# 真机的实际配置：左屏 1920x1080 @(-1920,0)，右屏 2560x1440 @(0,0)
+REAL = (-1920, 0, 4480, 1440)
+check("真机配置下 @(231,92)+1920x1080 -> 其实完整可见（我一开始误判为切边）",
+      wf.offscreen_px(231, 92, 1920, 1080, REAL) == (0, 0))
+check("真机配置下 @(-1920,0)+1920x1080 -> 铺满左屏，完整可见",
+      wf.offscreen_px(-1920, 0, 1920, 1080, REAL) == (0, 0))
+check("fully_visible 与 offscreen_px 一致",
+      wf.fully_visible(-1920, 0, 1920, 1080, DUAL) is True
+      and wf.fully_visible(231, 92, 1920, 1080, DUAL) is False)
+check("接受元组以外的列表形式", wf.offscreen_px(0, 0, 1920, 1080, [0, 0, 1920, 1080]) == (0, 0))
+check("度量常量没写错（SM_*VIRTUALSCREEN）",
+      (wf.SM_XVIRTUALSCREEN, wf.SM_YVIRTUALSCREEN,
+       wf.SM_CXVIRTUALSCREEN, wf.SM_CYVIRTUALSCREEN) == (76, 77, 78, 79))
+check("find_game_window 会带回 screen 字段",
+      "screen" in open(wf.__file__, "rb").read().decode("utf-8"))
+
+print()
+print("K. 本模块源码 GBK 安全（Windows 控制台/管道不会崩）")
 
 src = open(wf.__file__, "rb").read().decode("utf-8")
 try:

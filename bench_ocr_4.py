@@ -86,7 +86,11 @@ def cover_ratio(ref_best, cand_best):
 
 def select_frames(eng):
     os.makedirs(os.path.join(ROOT, "ocr_hard_shots"), exist_ok=True)
-    _tmpl = hint_roi(cv2.imread(os.path.join(ROOT,"flip_debug","chat_180001_on_b100_t3.jpg")))
+    # 同 bench_ocr_3：取证帧会被滚动清理，别写死文件名（chat_180001… 已被清掉）。
+    _flip = glob.glob(os.path.join(ROOT, "flip_debug", "chat_*.jpg"))
+    if not _flip:
+        print("[警告] flip_debug 下没有 chat_*.jpg，取不到提示行底噪模板"); return []
+    _tmpl = hint_roi(cv2.imread(max(_flip, key=os.path.getmtime)))
     def hscore(fr):
         r = hint_roi(fr)
         if r.shape != _tmpl.shape: r = cv2.resize(r, (_tmpl.shape[1], _tmpl.shape[0]))

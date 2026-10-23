@@ -54,8 +54,11 @@ python -m pip install -r requirements.txt
 2. **人设**：把 `persona.example.txt` 复制为 `persona.txt`，
    写上你的 TA 是谁（协议段落别删）
 3. **模板**：`templates/` 目录随代码放在一起（1080p 基准，自动缩放）
-4. **视觉模型（可选）**：YOLO 权重 `best.pt` 不入库，用 `train_yolo.py`
-   采集标注后训练生成；基础模型 `yolov8n.pt` 由 ultralytics 首次运行自动下载。
+4. **视觉模型（可选）**：YOLO 权重 `best.pt` 不入库，可从
+   [GitHub Release](https://github.com/KerunK336651/sky-with-you/releases)
+   下载（权重以 CC BY-NC-SA 4.0 发布，校验值见 Release 中的 `SHA256SUMS`），
+   放到程序默认模型路径；也可用 `train_yolo.py` 自行采集标注后训练生成。
+   基础模型 `yolov8n.pt` 由 ultralytics 首次运行自动下载。
    不装 YOLO 也能靠模板匹配正常运行
 
 ## 启动（两个终端）
@@ -131,10 +134,21 @@ YOLO 视觉识别、动作（牵手 / 坐下 / 抱抱 / 回遇境）逻辑；调
 
 ## 免责声明
 
-本项目是屏幕识别 + 键盘注入的自动化工具，仅供学习与研究。
+本项目是屏幕识别 + 键盘注入的自动化工具，**仅供学习与研究**。
 自动化操作可能违反游戏的用户协议，使用风险自负。
 它不修改游戏、不读写游戏内存、不影响其他玩家。
 
+作者明确反对将本项目用于违反《光·遇》用户协议、破坏游戏公平、
+伤害其他玩家或任何商业性运营（代练、批量账号等）的用途。
+
 ## License
 
-MIT
+- **代码**：[GNU General Public License v3.0（GPL-3.0）](LICENSE)
+  —— 允许使用、修改与分发，但衍生作品必须保持开源并以相同协议发布。
+- **模型权重**：[CC BY-NC-SA 4.0](MODEL_WEIGHTS_LICENSE.md)
+  —— 署名原作者、非商业用途、衍生权重须以相同协议共享。
+- **第三方来源**：见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)，
+  上游项目以 MIT 许可证授权，其版权声明已保留。
+
+> 版权所有 © 2026 珂珂（KerunK336651）
+> 训练所用游戏截图版权归 thatgamecompany / TGC 所有，完整数据集不公开分发。

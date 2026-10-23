@@ -178,6 +178,91 @@ except Exception as e:
     ok = False
 check("连续创建多个引擎（项目里 3 个调用点）不抛异常", ok)
 
+print("\n--- ocr_infer：推理串行化（2026-10-06 DML 崩溃后的加固）---")
+
+import threading as _threading
+import time as _time
+
+# 背景：真机崩在 amdxc64.dll，调用链 ORT->DirectML->D3D12（无 d3d11/dxgi 帧），
+# 而循环里有 3 个引擎 / 6 个 DirectML 会话 / 3 个线程并发推理。改成串行化。
+check("默认开启串行化（SKY_OCR_SERIALIZE 未设时为 1）",
+      PD._OCR_SERIALIZE is True)
+check("锁是真实存在的 Lock 对象",
+      hasattr(PD._OCR_INFER_LOCK, "acquire") and hasattr(PD._OCR_INFER_LOCK, "release"))
+
+check("engine 为 None 时返回 (None, None)，不抛异常",
+      PD.ocr_infer(None, object()) == (None, None))
+
+
+class _FakeEngine(object):
+    """假引擎：记录同时进入的次数，用来验证串行化。"""
+
+    def __init__(self, delay=0.05):
+        self.delay = delay
+        self.inside = 0
+        self.max_inside = 0
+        self.calls = 0
+        import threading as _t
+        self._guard = _t.Lock()
+
+    def __call__(self, img):
+        with self._guard:
+            self.inside += 1
+            self.calls += 1
+            self.max_inside = max(self.max_inside, self.inside)
+        _time.sleep(self.delay)
+        with self._guard:
+            self.inside -= 1
+        return [("box", "text", 0.9)], [1.0]
+
+
+import threading as _threading
+
+eng = _FakeEngine()
+try:
+    r, el = PD.ocr_infer(eng, "img")
+    ok = (r == [("box", "text", 0.9)] and el == [1.0] and eng.calls == 1)
+except Exception:
+    ok = False
+check("正常调用：透传引擎结果，且只调用一次", ok)
+
+# 拉 4 个线程同时打同一个引擎：串行化下 max_inside 必须为 1
+eng2 = _FakeEngine(delay=0.08)
+threads = [_threading.Thread(target=PD.ocr_infer, args=(eng2, "img")) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+check("并发 4 线程 -> 同时进入引擎的最多 1 个（已串行化）",
+      eng2.max_inside == 1 and eng2.calls == 4)
+
+# 关掉串行化应当能观察到并发（证明开关真的起作用，而不是恒等于 1）
+real_flag = PD._OCR_SERIALIZE
+try:
+    PD._OCR_SERIALIZE = False
+    eng3 = _FakeEngine(delay=0.12)
+    threads = [_threading.Thread(target=PD.ocr_infer, args=(eng3, "img")) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    check("SKY_OCR_SERIALIZE=0（关闭）-> 能观察到并发（开关有效）",
+          eng3.max_inside >= 2 and eng3.calls == 4)
+finally:
+    PD._OCR_SERIALIZE = real_flag
+check("测试后恢复默认开关", PD._OCR_SERIALIZE is True)
+
+# 结构断言：三处推理调用点都必须走 ocr_infer，别再有裸调用
+_root = os.path.dirname(os.path.abspath(__file__))
+_pd_src = open(os.path.join(_root, "panel_detector.py"), "rb").read().decode("utf-8")
+_loop_src = open(os.path.join(_root, "sky-loop-v7.py"), "rb").read().decode("utf-8")
+check("panel_detector 里没有裸的 self._ensure_ocr_engine()(img)",
+      "_ensure_ocr_engine()(img)" not in _pd_src)
+check("sky-loop 里没有裸的 ocr_engine(im)", "ocr_engine(im)" not in _loop_src)
+check("sky-loop 里没有裸的 engine(gray_eq)", "engine(gray_eq)" not in _loop_src)
+check("三处调用点都用 ocr_infer",
+      _pd_src.count("ocr_infer(") >= 2 and _loop_src.count("ocr_infer(") >= 2)
+
 print("\nPASS=%d FAIL=%d SKIP=%d" % (npass, nfail, nskip))
 if nfail:
     print("有 %d 条失败" % nfail)

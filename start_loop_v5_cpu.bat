@@ -1,15 +1,12 @@
 @echo off
 cd /d "%~dp0"
-title Sky Loop v7.1 (PP-OCRv5 / OCR on CPU)
+title Sky Loop v7.1 (PP-OCRv5 / CPU)
 echo ========================================
-echo   Sky Loop v7.1  --  OCR FORCED TO CPU
+echo   Sky Loop v7.1  PP-OCRv5  OCR-FORCED-CPU
 echo   Chat engine: sky-companion port
 echo   Input backend: Arduino (auto port)
+echo   Supervised: on crash -> auto fallback to CPU OCR
 echo ========================================
-echo.
-echo   This variant is ONLY for the frame-drop A/B test:
-echo   compare in-game FPS against start_loop_v5.bat (OCR on DML/GPU).
-echo   If FPS is the same, go back to start_loop_v5.bat (it is ~1.4x faster).
 echo.
 
 set SKY_LLM_PROVIDER=deepseek
@@ -38,11 +35,25 @@ if not exist key.txt (
     echo.
 )
 
-echo [1/2] Checking python...
+echo [1/3] Checking python...
 py --version
 echo.
-echo [2/2] Starting main loop...
-py sky-loop-v7.py 2>&1
+rem ====== MCP preflight: all key presses go through it, no MCP = chat panel never opens ======
+echo [2/3] Checking MCP server (127.0.0.1:9900)...
+py -c "import socket;s=socket.socket();s.settimeout(0.8);raise SystemExit(0 if s.connect_ex(('127.0.0.1',9900))==0 else 1)" >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo  [WARN] MCP server is NOT running on 127.0.0.1:9900.
+    echo         Key presses are forwarded by MCP, so the chat panel would never open.
+    echo         Starting start_mcp.bat automatically, waiting 4s...
+    start "Sky MCP Server" cmd /k "%~dp0start_mcp.bat"
+    timeout /t 4 /nobreak >nul
+) else (
+    echo  [OK] MCP server is running.
+)
+echo.
+echo [3/3] Starting main loop under supervisor (py run_loop.py)...
+py run_loop.py 2>&1
 echo.
 echo [Loop exited with code %ERRORLEVEL%]
 pause

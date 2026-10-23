@@ -43,6 +43,10 @@ SAFE = [
     "test_doctor.py",           # doctor.py 检查逻辑
     "test_ocr_engine.py",       # OCR 引擎装配：v3/v5 指纹 + DML/CPU 设备 + 三条回退路径
     "test_window_fix.py",       # 窗口 1080p 对齐：尺寸反算/缩放比/参数解析（纯计算，不碰窗口）
+    "test_capture_backend.py",  # DXGI 截屏坐标系适配：绝对->输出相对、跨屏判据（打桩，不建真实相机）
+    "test_run_loop.py",         # 看护进程：崩溃码判据/决策表/记忆文件（端到端只起立刻退出的小子进程）
+    "test_evidence.py",         # 取证帧命名与清理：按 mtime 保留，钉住「写一张删一张」回归
+    "test_reopen_action.py",    # 动作后主动重开面板：场景/弹窗/好友树/冷却 门控（打桩）
     "test_ocr_enhance.py",      # OCR 增强（会跑真实 OCR，最慢，放最后）
 ]
 

@@ -70,7 +70,13 @@ def main():
         gh, gw = fr.shape[:2]
         gg = cv2.cvtColor(fr, cv2.COLOR_BGR2GRAY)
         return gg[int(gh*HINT[1]):int(gh*HINT[3]), int(gw*HINT[0]):int(gw*HINT[2])]
-    _tmpl = hint_roi(cv2.imread(os.path.join(ROOT,"flip_debug","chat_180001_on_b100_t3.jpg")))
+    # 原先写死 chat_180001_on_b100_t3.jpg。取证帧会被 flip_snapshot_keep 滚动清理，
+    # 写死迟早失效（那张已被清掉，imread 返回 None 会让下面的 resize 直接崩）。
+    # 改成取目录里 mtime 最新的一张当底噪模板 —— 任意一帧聊天帧都够用。
+    _flip = glob.glob(os.path.join(ROOT, "flip_debug", "chat_*.jpg"))
+    if not _flip:
+        print("[警告] flip_debug 下没有 chat_*.jpg，取不到提示行底噪模板"); return
+    _tmpl = hint_roi(cv2.imread(max(_flip, key=os.path.getmtime)))
     def hint_score(fr):
         r = hint_roi(fr)
         if r.shape != _tmpl.shape: r = cv2.resize(r, (_tmpl.shape[1], _tmpl.shape[0]))

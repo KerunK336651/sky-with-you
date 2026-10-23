@@ -15,7 +15,7 @@
     py window_fix.py --apply --x 0 --y 0
     py window_fix.py --size 1600x900  # 换一个目标尺寸
 
-三个必须注意的点：
+四个必须注意的点：
   1. 必须先 SetProcessDPIAware()。否则 GetClientRect/SetWindowPos 拿到的是
      「逻辑像素」，在 125%/150% 缩放的显示器上会与实际像素错开，算出来的尺寸是错的。
   2. 改的是「客户区」。SetWindowPos 设的是整窗（含标题栏与边框），所以必须先用
@@ -23,9 +23,16 @@
   3. 改窗口尺寸 != 改游戏内部渲染分辨率。光遇 PC 按客户区尺寸渲染，两者一致；
      但如果你在游戏里单独调低过画质/渲染分辨率，模板匹配仍然会偏。
      另外独占全屏（exclusive fullscreen）改不了尺寸，先在游戏里切成窗口或无边框窗口。
+  4. **权限**：2026-10-06 真机实测，游戏在跑时三种改尺寸写法全部失败。
+     光遇国服客户端带反作弊、通常以管理员权限运行，而普通终端里的 Python 权限比它低，
+     Windows 的 UIPI 会拦掉对高权限窗口的一切「写」操作——读窗口位置/尺寸不受影响，
+     所以 GetClientRect 一直是好的，只有 SetWindowPos/MoveWindow 会失败。
+     **对策：把终端「以管理员身份运行」，再执行 --apply。**
+     失败时本脚本会逐个策略打印 Win32 错误码与含义，别只看一句"失败"。
 
 只在本文件里做 Windows API 调用；纯计算部分（compute_outer_size / scale_ratio /
-needs_fix）不碰 Win32，可离线测试（test_window_fix.py）。
+needs_fix / parse_size / describe / explain_win32_error）不碰 Win32，可离线测试
+（test_window_fix.py）。
 """
 import argparse
 import ctypes
@@ -42,6 +49,16 @@ CONSOLE_CLASSES = {"ConsoleWindowClass", "CASCADING_HOSTING_WINDOW_CLASS",
 GWL_STYLE, GWL_EXSTYLE = -16, -20
 SW_RESTORE = 9
 SWP_NOZORDER, SWP_NOACTIVATE = 0x0004, 0x0010
+
+# SetWindowPos/MoveWindow 失败时最常见的几个 Win32 错误码（纯查表，可离线测）
+WIN32_ERRORS = {
+    5: "拒绝访问 —— 游戏进程权限比你高（反作弊/以管理员运行），"
+       "请把终端「以管理员身份运行」后重试",
+    6: "无效句柄",
+    87: "参数错误 —— 尺寸或样式不被该窗口接受",
+    1400: "无效的窗口句柄 —— 窗口可能在两次调用之间被销毁或重建了",
+    1401: "无效的菜单句柄",
+}
 
 
 # ───────────────────────── 纯计算（可离线测试） ─────────────────────────
@@ -76,19 +93,101 @@ def describe(client_w, client_h, target_w=REF_W, target_h=REF_H):
     return "客户区 %dx%d，正好是标定尺寸（素材缩放 %.2f）" % (client_w, client_h, ratio)
 
 
+def explain_win32_error(code):
+    """把 Win32 错误码翻译成中文说明（未知码也给出可读输出）。"""
+    code = int(code)
+    if code == 0:
+        return "Win32 错误 0：取不到错误码（可能被后续 API 调用冲掉了 last-error）"
+    if code in WIN32_ERRORS:
+        return "Win32 错误 %d：%s" % (code, WIN32_ERRORS[code])
+    return "Win32 错误 %d：未收录，可用 `certutil -error %d` 查" % (code, code)
+
+
+def parse_size(text):
+    """'1920x1080' / '1920X1080' / '1920*1080' -> (1920, 1080)。非法抛 ValueError。"""
+    s = str(text).lower().replace("*", "x").replace(",", "x")
+    parts = [p for p in s.split("x") if p.strip()]
+    if len(parts) != 2:
+        raise ValueError("尺寸格式应为 宽x高，例如 1920x1080，收到 %r" % text)
+    w, h = int(parts[0]), int(parts[1])
+    if w <= 0 or h <= 0:
+        raise ValueError("尺寸必须为正数，收到 %r" % text)
+    return w, h
+
+
+# 虚拟屏幕（覆盖全部显示器）的度量常量
+SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+
+
+def offscreen_px(client_left, client_top, client_w, client_h, screen):
+    """客户区有多少像素落在虚拟屏幕之外，返回 (横向超出, 纵向超出)；都 0 表示完整可见。
+
+    screen 是 (x, y, w, h)。为什么要查这个：
+      * 客户区哪怕超出屏幕一点点，那部分 Windows 根本不会绘制，截到的就是桌面/黑块，
+        落在里面的模板与 ROI 必然判错；
+      * DXGI 截屏（bettercam/dxcam）对越界/跨屏区域更容易直接抓取失败，
+        于是 panel_detector 连续失败 3 次后会永久退回 GDI（见其 1321 行注释），
+        等于把"零干扰截屏"这个优化白白丢掉。
+      2026-10-06 真机就出现过 @(231,92) + 1920x1080 这种右边/下边出屏的位置。
+    """
+    vx, vy, vw, vh = [int(v) for v in screen]
+    l, t = int(client_left), int(client_top)
+    r, b = l + int(client_w), t + int(client_h)
+    dx = max(0, vx - l) + max(0, r - (vx + vw))
+    dy = max(0, vy - t) + max(0, b - (vy + vh))
+    return dx, dy
+
+
+def fully_visible(client_left, client_top, client_w, client_h, screen):
+    """客户区是否完整落在虚拟屏幕内。"""
+    return offscreen_px(client_left, client_top, client_w, client_h, screen) == (0, 0)
+
+
 # ───────────────────────── Win32（只在 Windows 上调用） ─────────────────────────
 
+_USER32 = None
+
+
 def _user32():
-    return ctypes.windll.user32
+    """use_last_error=True 才能可靠拿到 SetWindowPos 的失败原因；
+    并显式声明签名，避免 64 位下 HWND / 尺寸被按错误的宽度传递。"""
+    global _USER32
+    if _USER32 is None:
+        from ctypes import wintypes
+        u = ctypes.WinDLL("user32", use_last_error=True)
+        u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND,
+                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_uint]
+        u.SetWindowPos.restype = wintypes.BOOL
+        u.MoveWindow.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                 ctypes.c_int, ctypes.c_int, wintypes.BOOL]
+        u.MoveWindow.restype = wintypes.BOOL
+        u.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetClientRect.restype = wintypes.BOOL
+        u.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        u.GetWindowRect.restype = wintypes.BOOL
+        u.IsZoomed.argtypes = [wintypes.HWND]
+        u.IsZoomed.restype = wintypes.BOOL
+        _USER32 = u
+    return _USER32
 
 
 def make_dpi_aware():
     """拿物理像素。必须在任何 GetClientRect / SetWindowPos 之前调用。"""
     try:
-        _user32().SetProcessDPIAware()
+        ctypes.windll.user32.SetProcessDPIAware()
         return True
     except Exception:
         return False
+
+
+def is_elevated():
+    """当前进程是否以管理员权限运行（失败时返回 None = 未知）。"""
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return None
 
 
 def find_game_window(titles=WINDOW_TITLES, console_classes=CONSOLE_CLASSES):
@@ -135,6 +234,9 @@ def find_game_window(titles=WINDOW_TITLES, console_classes=CONSOLE_CLASSES):
         dpi = int(user32.GetDpiForWindow(hwnd)) or 96
     except Exception:
         dpi = 96
+    sm = user32.GetSystemMetrics
+    screen = (int(sm(SM_XVIRTUALSCREEN)), int(sm(SM_YVIRTUALSCREEN)),
+              int(sm(SM_CXVIRTUALSCREEN)), int(sm(SM_CYVIRTUALSCREEN)))
     return {
         "hwnd": hwnd, "title": title,
         "client_w": int(crect.right - crect.left),
@@ -145,6 +247,7 @@ def find_game_window(titles=WINDOW_TITLES, console_classes=CONSOLE_CLASSES):
         "outer_h": int(orect.bottom - orect.top),
         "dpi": dpi,
         "maximized": bool(user32.IsZoomed(hwnd)),
+        "screen": screen,
     }
 
 
@@ -167,31 +270,49 @@ def _make_adjust(hwnd):
         else:
             ok = user32.AdjustWindowRectEx(ctypes.byref(r), style, False, exstyle)
         if not ok:
-            raise OSError("AdjustWindowRect%s 失败" % ("ExForDpi" if has_dpi_api else "Ex"))
+            raise OSError("AdjustWindowRect%s 失败（%s）"
+                          % ("ExForDpi" if has_dpi_api else "Ex",
+                             explain_win32_error(ctypes.get_last_error())))
         return {"left": r.left, "top": r.top, "right": r.right, "bottom": r.bottom}
 
     return adjust, has_dpi_api, dpi
 
 
 def apply_resize(hwnd, outer_w, outer_h, x, y):
-    """把整窗尺寸/位置设成给定值；最大化状态先还原。返回是否 SetWindowPos 成功。"""
+    """把整窗尺寸/位置设成给定值；最大化先还原。
+
+    返回 (是否成功, 成功的策略名, 最后一次的 Win32 错误码)。
+    依次尝试三种写法，因为不同窗口/权限状态下能生效的那个不一样：
+      A. SetWindowPos + SWP_NOZORDER + SWP_NOACTIVATE（最不打扰用户）
+      B. SetWindowPos 不带 SWP_NOACTIVATE（有些窗口不接受"不激活"的改尺寸）
+      C. MoveWindow（老 API，行为略有不同）
+    """
     user32 = _user32()
     if user32.IsZoomed(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-    return bool(user32.SetWindowPos(hwnd, 0, int(x), int(y), int(outer_w), int(outer_h),
-                                    SWP_NOZORDER | SWP_NOACTIVATE))
 
-
-def parse_size(text):
-    """'1920x1080' / '1920X1080' / '1920*1080' -> (1920, 1080)。非法抛 ValueError。"""
-    s = str(text).lower().replace("*", "x").replace(",", "x")
-    parts = [p for p in s.split("x") if p.strip()]
-    if len(parts) != 2:
-        raise ValueError("尺寸格式应为 宽x高，例如 1920x1080，收到 %r" % text)
-    w, h = int(parts[0]), int(parts[1])
-    if w <= 0 or h <= 0:
-        raise ValueError("尺寸必须为正数，收到 %r" % text)
-    return w, h
+    attempts = [
+        ("SetWindowPos(不激活不置顶)",
+         lambda: user32.SetWindowPos(hwnd, None, int(x), int(y), int(outer_w), int(outer_h),
+                                     SWP_NOZORDER | SWP_NOACTIVATE)),
+        ("SetWindowPos(允许激活)",
+         lambda: user32.SetWindowPos(hwnd, None, int(x), int(y), int(outer_w), int(outer_h),
+                                     SWP_NOZORDER)),
+        ("MoveWindow",
+         lambda: user32.MoveWindow(hwnd, int(x), int(y), int(outer_w), int(outer_h), True)),
+    ]
+    last_err = 0
+    for name, call in attempts:
+        ctypes.set_last_error(0)
+        ok = bool(call())
+        err = ctypes.get_last_error()
+        print("      尝试 %-24s -> %s%s"
+              % (name, "成功" if ok else "失败",
+                 "" if ok else "（%s）" % explain_win32_error(err)))
+        if ok:
+            return True, name, err
+        last_err = err
+    return False, "", last_err
 
 
 def main(argv=None):
@@ -219,12 +340,27 @@ def main(argv=None):
         print("没找到光遇窗口 —— 先把游戏开起来（窗口标题要含 '光·遇'，不能最小化）")
         return 1
 
+    elev = is_elevated()
     print("找到游戏窗口「%s」" % win["title"])
+    print("  本进程权限: %s"
+          % ("管理员" if elev else ("普通用户（改不了高权限窗口；--apply 失败就先提权重试）"
+                                    if elev is not None else "未知")))
     print("  DPI: %d（缩放 %.0f%%）" % (win["dpi"], win["dpi"] / 96.0 * 100))
     print("  客户区: %dx%d @(%d,%d)" % (win["client_w"], win["client_h"],
                                         win["left"], win["top"]))
     print("  整窗:   %dx%d" % (win["outer_w"], win["outer_h"]))
     print("  %s" % describe(win["client_w"], win["client_h"], target_w, target_h))
+    scr = win.get("screen") or (0, 0, 0, 0)
+    print("  虚拟屏幕（全部显示器）: %dx%d @(%d,%d)" % (scr[2], scr[3], scr[0], scr[1]))
+    dx, dy = offscreen_px(win["left"], win["top"], win["client_w"], win["client_h"], scr)
+    if (dx, dy) != (0, 0):
+        print("  [警告] 客户区有 %d 像素横向、%d 像素纵向落在屏幕之外 —— "
+              "那部分截到的会是桌面/黑块，落在里面的模板与 ROI 必然判错；"
+              "而且 DXGI 截屏（bettercam/dxcam）对越界区域容易直接失败、"
+              "连续 3 次后会被动退回 GDI。" % (dx, dy))
+        print("         建议把窗口完整挪进某一块屏（例如铺满左侧那块 1920x1080 的屏）。")
+    else:
+        print("  客户区完整落在屏幕内（可见，未被切边）")
     if win["maximized"]:
         print("  注意：窗口当前是最大化，--apply 时会先还原（ShowWindow SW_RESTORE）")
 
@@ -250,19 +386,30 @@ def main(argv=None):
         print("")
         print("（预演，未改动你的窗口）要真正生效请加 --apply：")
         print("    py window_fix.py --apply")
+        print("  提示：若 --apply 报「拒绝访问」，请把终端「以管理员身份运行」后重试。")
         return 0
 
-    if not apply_resize(win["hwnd"], outer_w, outer_h, x, y):
-        print("SetWindowPos 失败 —— 如果游戏是独占全屏，先在游戏里切成窗口/无边框窗口")
+    print("")
+    ok, how, err = apply_resize(win["hwnd"], outer_w, outer_h, x, y)
+    if not ok:
+        print("")
+        print("三种改尺寸的写法都失败了。最后一次：%s" % explain_win32_error(err))
+        if err == 5:
+            print("  -> 这是权限问题（UIPI）。关掉终端，改用「以管理员身份运行」打开，再执行：")
+            print("         py window_fix.py --apply")
+            print("     仍然失败的话，就在游戏里手动把窗口拖到 1920x1080（或设成无边框窗口再拖）。")
+        elif err == 87:
+            print("  -> 游戏不接受这个尺寸。试试在游戏里切成「窗口」或「无边框窗口」模式再跑。")
+        else:
+            print("  -> 若游戏是独占全屏，先在游戏里切成窗口/无边框窗口；仍不行请把上面输出发我。")
         return 1
 
     after = find_game_window()
     if not after:
         print("改完之后找不到窗口了，请手动确认")
         return 1
-    print("")
-    print("改完：客户区 %dx%d，整窗 %dx%d（素材缩放 %.3f）"
-          % (after["client_w"], after["client_h"], after["outer_w"], after["outer_h"],
+    print("改完（策略：%s）：客户区 %dx%d，整窗 %dx%d（素材缩放 %.3f）"
+          % (how, after["client_w"], after["client_h"], after["outer_w"], after["outer_h"],
              scale_ratio(after["client_h"])))
     if needs_fix(after["client_w"], after["client_h"], target_w, target_h):
         print("没达到目标尺寸 —— 游戏可能有自己的窗口尺寸约束，或仍在独占全屏")

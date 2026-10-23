@@ -156,6 +156,37 @@ def _tame_process(max_cores=None):
 _tame_process()
 
 
+# ===================== OCR 推理串行化 =====================
+# 2026-10-06 真机崩溃：退出码 -1073741819（0xC0000005），错误模块 amdxc64.dll
+# （AMD 显卡驱动的 DirectX 组件），偏移 0x3d978d。用自写的 minidump 解析器（_dump_analyze.py）
+# 读出故障线程的调用链，整条栈是：
+#     onnxruntime_pybind11_state.pyd -> DirectML.dll(十余帧) -> D3D12Core.dll -> amdxc64.dll  <- 崩
+# **栈里没有任何 d3d11.dll / dxgi.dll 帧**，所以不是截屏后端（bettercam/DXGI）的问题，
+# 是 DirectML 推理。异常参数 params[0]=1（写）、params[1]=0x2814338dc3c（野地址）。
+#
+# 循环里同时存在 3 个 RapidOCR 实例（聊天 OCR / PD-OCR / 名字 OCR），每个含 det+rec
+# 两个 ONNX 会话 = 6 个 DirectML 会话，分布在 3 个线程里并发推理；而单线程单会话的
+# DML 基准测试（第二十六/二十七章、test_ocr_engine.py）从来没崩过。故判断触发条件是
+# 并发，这里用一把进程级锁把所有推理串行化。
+# 复现/对照实验可设 SKY_OCR_SERIALIZE=0 关掉。
+_OCR_SERIALIZE = (os.environ.get("SKY_OCR_SERIALIZE", "1").strip() != "0")
+_OCR_INFER_LOCK = threading.Lock()
+
+
+def ocr_infer(engine, img):
+    """调用 OCR 引擎的**唯一入口**，返回引擎原始结果 (result, elapse)。
+
+    默认把推理串行化（原因见上方注释）。SKY_OCR_SERIALIZE=0 时退回并发。
+    engine 为 None 时返回 (None, None)，与"没识别到"同形，调用方无需特判。
+    """
+    if engine is None:
+        return None, None
+    if not _OCR_SERIALIZE:
+        return engine(img)
+    with _OCR_INFER_LOCK:
+        return engine(img)
+
+
 def _log_ocr_engine(eng):
     """打印 OCR 引擎【实际生效】的模型与推理设备。
 
@@ -228,7 +259,7 @@ def make_ocr_engine():
 class DetectorConfig:
     # ROI 均为相对坐标 (x0, y0, x1, y1)
     roi_chat: tuple = (0.01, 0.30, 0.40, 0.90)      # 完整聊天面板（消息区，左边界0.015→0.01防止第一个字被吞，0.005太靠左会不识别）
-    roi_chat_input: tuple = (0.030, 0.80, 0.320, 0.96)  # 输入框搜索区（在此纵向找最黑横条，免疫窗口偏移）
+    roi_chat_input: tuple = (0.002, 0.80, 0.320, 0.96)  # 输入框搜索区（左边界必须盖住铅笔图标，图标在 x≈0.003；切掉会"有黑带无亮点"误判关）
     # chat 模板（输入框左角+铅笔图标）专属搜索区：x 必须从 0 起——图标从
     # x≈0.006 就开始，用 roi_chat/roi_chat_input 搜会削掉半个图标（07-03 教训）
     roi_chat_box: tuple = (0.0, 0.76, 0.34, 0.99)
@@ -254,6 +285,12 @@ class DetectorConfig:
     # 面板关着时别人的悬浮消息气泡会伪装成输入框——靠这条区分（2026-07-02 实测）
     # 注意：亮箱 0.020 与气泡 0.029 之间余量不大，待实拍悬浮气泡样本后复核
     chat_band_text: float = 0.025     # 条带内亮点超过此值 = 气泡/打字中，不表态
+    # 铅笔图标局部密度（2026-10-06 真机帧标定）：输入框最左侧圆形铅笔图标是
+    # 面板最特异的身份证。在整个输入框纵向范围扫描、取最高密度：
+    # 面板开 0.53~0.68 / 面板关 0.00~0.09（退出特殊帧 0.23），0.40 两头余量充足。
+    # 比整带亮点占比稳（不受打字文字影响），也不依赖模板。
+    chat_pencil_x: tuple = (0.003, 0.022)  # 铅笔图标在输入框横带中的横向范围
+    chat_pencil_on: float = 0.40      # 铅笔区亮像素密度超过此值 → 面板开
     chat_glow_veto: float = 0.35      # 判关时条带白光占比超过此值 = 疑似火光晃瞎
                                       # （实测：正常关 0.000，举火 0.709~1.000）
     chat_glow_local: float = 40.0     # 火光必须是局部辉光：条带均值比全帧均值高出
@@ -656,12 +693,151 @@ def find_game_client_region(titles: tuple) -> dict | None:
     return {"left": pt.x, "top": pt.y, "width": w, "height": h}
 
 
-# ===================== 检测器 =====================
+# ===================== DXGI 截屏的坐标系适配 =====================
+# dxcam/bettercam 的 grab(region=...) 用的是「所选输出(显示器)左上角为原点」的坐标，
+# **不是绝对桌面坐标**；而且 create() 默认 output_idx=0 = 主屏。
+# 2026-10-06 真机实测（左屏 1920x1080 @(-1920,0) 是游戏所在，右屏 2560x1440 是主屏）：
+#   create() -> region=(0,0,2560,1440)                     # 默认拿到主屏
+#   grab((-1920,0,0,1080)) -> ValueError: Invalid Region: Region should be in 2560x1440
+#   create(output_idx=1) + grab((0,0,1920,1080)) -> OK     # 相对坐标才对
+# 后果：旧实现传绝对坐标，连抛 3 次就被 _sense_loop 永久切回 GDI，
+# 日志却已经打过一行「截屏后端: bettercam/DXGI」——装了等于没装，还看不出来。
+# 所以必须先把绝对区域映射到某一块输出上，再换算成相对坐标。
+
+def _pick_output(outputs, left, top, right, bottom):
+    """从 [(obj, (ol, ot, orr, ob)), ...] 里挑出**完全包含**该绝对矩形的第一块。
+
+    跨屏或被切边的区域没有单一输出能包含它（DXGI 抓不了），返回 None。
+    纯函数，可离线单测。
+    """
+    for item in (outputs or []):
+        obj, rect = item[0], item[1]
+        if rect[0] <= left and rect[1] <= top and right <= rect[2] and bottom <= rect[3]:
+            return item
+    return None
+
+
+def _to_output_relative(rect, left, top, right, bottom):
+    """绝对桌面矩形 -> 相对该输出的矩形（dxcam/bettercam 要的是这个）。纯函数。"""
+    return (int(left) - int(rect[0]), int(top) - int(rect[1]),
+            int(right) - int(rect[0]), int(bottom) - int(rect[1]))
+
+
+def _output_desktop_rect(cam):
+    """取 bettercam/dxcam 某个输出设备的绝对桌面矩形 (l,t,r,b)；拿不到返回 None。
+
+    bettercam 的 Output 对象带 hmonitor（HMONITOR），直接问 Windows 最准
+    （真机实测：\\\\.\\DISPLAY1 -> (0,0,2560,1440)、\\\\.\\DISPLAY2 -> (-1920,0,0,1080)，
+    尺寸与该输出的 resolution 完全一致）。拿不到就不要猜——返回 None 让调用方回退 GDI。
+    """
+    try:
+        # 本文件不在模块层 import ctypes（见 L132 / L606 的既有风格），这里同样局部 import
+        import ctypes
+        from ctypes import wintypes
+        out = getattr(cam, "_output", None)
+        hm = getattr(out, "hmonitor", None) if out is not None else None
+        if not hm:
+            return None
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT),
+                        ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not ctypes.windll.user32.GetMonitorInfoW(ctypes.c_void_p(int(hm)),
+                                                    ctypes.byref(mi)):
+            print("  [PD-Sense] GetMonitorInfoW(hmonitor=%s) 失败（error=%d），"
+                  "无法把输出映射到桌面矩形" % (hm, ctypes.get_last_error()))
+            return None
+        return (int(mi.rcMonitor.left), int(mi.rcMonitor.top),
+                int(mi.rcMonitor.right), int(mi.rcMonitor.bottom))
+    except Exception as e:
+        # 不要静默吞掉：这里吞一次，现象就是"装了 bettercam 却悄悄退回 GDI"
+        # （第二十七章刚记过"静默补丁失败"的教训）
+        print("  [PD-Sense] 读取输出桌面矩形失败: %s: %s" % (type(e).__name__, e))
+        return None
+
+
+def _enum_dxgi_outputs(mod, max_outputs=8):
+    """枚举该模块能创建的输出，返回 [(cam, 绝对矩形), ...]（拿不到矩形的直接停）。
+
+    bettercam.create 对同一 (设备,输出) 会返回缓存的单例，所以这里**不要 release**：
+    真机实测 release 之后再 create 会拿到已被释放的对象（AcquireNextFrame 报 NoneType）。
+    """
+    outs = []
+    for idx in range(max_outputs):
+        try:
+            cam = mod.create(output_idx=idx, output_color="BGR")
+        except Exception:
+            break
+        if cam is None:
+            break
+        rect = _output_desktop_rect(cam)
+        if rect is None:
+            break
+        outs.append((cam, rect))
+    return outs
+
 
 def _crop(frame: np.ndarray, roi: tuple) -> np.ndarray:
     h, w = frame.shape[:2]
     x0, y0, x1, y1 = roi
     return frame[int(h * y0):int(h * y1), int(w * x0):int(w * x1)]
+
+
+# ── 取证帧的命名与清理（2026-10-06 修：原先按文件名排序清理，会把刚写的那张删掉）──
+
+def snapshot_name(prefix, when, mid="", metrics=None):
+    """生成取证帧文件名：`{prefix}_YYYYMMDD_HHMMSS[_mid]_b{暗带}_t{亮点}.jpg`（纯函数，可离线测）。
+
+    为什么要带日期（原先只有 HHMMSS）：
+        清理逻辑是 `sorted(glob(...))[:-keep]` —— 按**文件名**排序，于是排的是
+        "一天之内的时间顺序"，跨天完全错乱。真机实测后果：目录里已有一天 22:xx/23:xx 的
+        80 张（正好等于 flip_snapshot_keep=80），之后任何在 22 点之前写的帧（如 20:13:31）
+        按名字排在最前，**刚写完就被自己删掉**，而日志已经打印了"存证: ...jpg" ——
+        证据静默丢失，等你要用它排查问题时才发现没了。
+        带上日期后，文件名顺序 == 真实时间顺序，这个坑从根上消失。
+    """
+    ts = time.strftime("%Y%m%d_%H%M%S", time.localtime(when))
+    m = metrics or {}
+    parts = [prefix, ts]
+    if mid:
+        parts.append(mid)
+    parts.append("b%d_t%d" % (int(m.get("chat_band", 0) * 100),
+                              int(m.get("chat_bright", 0) * 1000)))
+    return "_".join(parts) + ".jpg"
+
+
+def _safe_mtime(path):
+    try:
+        return os.path.getmtime(path)
+    except OSError:
+        return 0.0
+
+
+def prune_snapshots(dirpath, tag, keep):
+    """只保留该 tag 下**按修改时间**最新的 keep 张，返回删除张数（可离线测）。
+
+    用 mtime 而不是文件名排序：即便将来命名格式再变、或新旧两种格式混在一个目录里，
+    也不会再出现"把刚写的那张删掉"。
+    另外 keep <= 0 视为全删 —— 原写法 `old[:-0]` 等于 `old[:0]` 是空列表，一张都不会删。
+    """
+    if keep is None:
+        return 0
+    paths = glob.glob(os.path.join(dirpath, "%s_*.jpg" % tag))
+    if keep <= 0:
+        doomed = list(paths)
+    else:
+        doomed = sorted(paths, key=_safe_mtime)[:-keep]
+    n = 0
+    for p in doomed:
+        try:
+            os.unlink(p)
+            n += 1
+        except OSError:
+            pass   # 已经被别人删了/文件被占用：不算错误
+    return n
 
 
 def judge_friend_tree_menu(texts, fh=1080, fw=1920, y_min=0.90, x_min=0.55):
@@ -909,7 +1085,7 @@ class PanelDetector:
         """外部主动取证：最新帧+当前 chat 指标存进 flip_debug。
         给调度器守门按 C 前调用——"状态冻结型"误判（雨林暗景：面板开着
         却一直判关）不产生翻转，光靠翻转存证一张都逮不到（07-03 Aki 实测
-        跑一轮雨林零存证）。文件名 {tag}_时分秒_b暗带_t亮点.jpg"""
+        跑一轮雨林零存证）。文件名 {tag}_年月日_时分秒_b暗带_t亮点.jpg"""
         if not self.cfg.debug:
             return
         frame = self.latest_frame()
@@ -920,14 +1096,9 @@ class PanelDetector:
         d = self.cfg.flip_snapshot_dir
         try:
             os.makedirs(d, exist_ok=True)
-            ts = time.strftime("%H%M%S")
-            b = int(m.get("chat_band", 0) * 100)
-            t = int(m.get("chat_bright", 0) * 1000)
-            path = os.path.join(d, f"{tag}_{ts}_b{b}_t{t}.jpg")
+            path = os.path.join(d, snapshot_name(tag, time.time(), "", m))
             cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-            old = sorted(glob.glob(os.path.join(d, f"{tag}_*.jpg")))
-            for p in old[:-self.cfg.flip_snapshot_keep]:
-                os.unlink(p)
+            prune_snapshots(d, tag, self.cfg.flip_snapshot_keep)
         except Exception as e:
             print(f"  [PD] 取证失败: {e}")
 
@@ -936,19 +1107,14 @@ class PanelDetector:
         d = self.cfg.flip_snapshot_dir
         try:
             os.makedirs(d, exist_ok=True)
-            ts = time.strftime("%H%M%S", time.localtime(now))
-            tag = {True: "on", False: "off"}.get(value, "unk")
-            b = int(metrics.get("chat_band", 0) * 100)
-            t = int(metrics.get("chat_bright", 0) * 1000)
-            path = os.path.join(d, f"chat_{ts}_{tag}_b{b}_t{t}.jpg")
+            mid = {True: "on", False: "off"}.get(value, "unk")
+            path = os.path.join(d, snapshot_name("chat", now, mid, metrics))
             okw = cv2.imwrite(path, frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
             if not okw:
                 print(f"  [PD] 翻转存证写入失败(imwrite返回False): {path}")
             else:
                 print(f"  [PD] chat 翻转存证: {path}")
-            old = sorted(glob.glob(os.path.join(d, "chat_*.jpg")))
-            for p in old[:-self.cfg.flip_snapshot_keep]:
-                os.unlink(p)
+            prune_snapshots(d, "chat", self.cfg.flip_snapshot_keep)
         except Exception as e:
             print(f"  [PD] 存证失败: {e}")
 
@@ -970,75 +1136,69 @@ class PanelDetector:
     # ---------- 视觉：聊天面板（沿用 sky-loop 经验阈值） ----------
 
     def _detect_chat(self, frame, gray_full):
-        """主特征 = 输入框条带：面板开时"聊天……"输入框是一整条近黑横条。
-        佐证 = 消息区暗底白字（泡泡里的字）或条带内亮点（铅笔图标）。"""
+        """主特征 = 输入框最左侧的圆形铅笔图标（面板最特异的身份证）。
+        在整个输入框纵向范围滑窗扫描铅笔区亮像素密度、取最高：
+        面板开 0.53~0.68 / 面板关 0.00~0.09。满宽暗带、白字（气泡/打字）
+        等其余特征只在无铅笔时兜底裁决。"""
         cfg = self.cfg
+        h_full, w_full = gray_full.shape
         strip = _crop(gray_full, cfg.roi_chat_input)
-        # 在搜索区内纵向滑窗，找"满宽暗行"最密集的一条横带 = 输入框实际位置。
-        # 满宽判据排除残留气泡；不写死纵坐标，窗口化/标题栏/分辨率变化都不影响。
+        k = max(3, int(h_full * cfg.chat_input_height))
+        # 铅笔图标相对 strip 的横向范围
+        X0 = int(cfg.roi_chat_input[0] * w_full)
+        px0 = max(0, int(cfg.chat_pencil_x[0] * w_full) - X0)
+        px1 = int(cfg.chat_pencil_x[1] * w_full) - X0
+        # 满宽暗行（找输入框横带）
         rows_dark = np.mean(strip < 80, axis=1)
         qualified = (rows_dark > cfg.chat_row_full).astype(np.float32)
-        k = max(3, int(gray_full.shape[0] * cfg.chat_input_height))
-        if len(qualified) > k:
-            smooth = np.convolve(qualified, np.ones(k) / k, mode="valid")
-            mx = float(smooth.max())
-            # 并列极大时取最靠下的窗口：输入框永远是面板最底部的满宽元素，
-            # 悬浮消息气泡都在它上面
-            best = int(np.where(smooth >= mx - 0.02)[0][-1])
-            band_dark = mx
-            win = strip[best:best + k]
-            qmask = qualified[best:best + k] > 0
-            # 亮点只统计满宽行本身，窗口里混进的窄气泡/背景行不算
-            band = win[qmask] if qmask.any() else win
-        else:
-            band = strip
-            band_dark = float(qualified.mean())
-        band_bright = float(np.mean(band > 140))
+
+        # ---- 全 strip 滑窗扫描铅笔图标密度，取最高 ----
+        pencil_best = 0.0
+        if len(qualified) > k and px1 > px0:
+            for i in range(strip.shape[0] - k + 1):
+                seg = strip[i:i + k, px0:px1]
+                if seg.size:
+                    d = float(np.mean(seg > 140))
+                    if d > pencil_best:
+                        pencil_best = d
+
+        # 消息区暗底白字佐证
         msg = _crop(gray_full, cfg.roi_chat)
         bright_m = (msg > 190).astype(np.uint8)
         dark_m = cv2.dilate((msg < 80).astype(np.uint8), np.ones((9, 9), np.uint8))
         wod = float(np.mean((bright_m & dark_m) > 0))
-        m = {"chat_band": band_dark, "chat_wod": wod, "chat_bright": band_bright}
+
+        # 暗带统计（兜底用）
+        if len(qualified) > k:
+            smooth = np.convolve(qualified, np.ones(k) / k, mode="valid")
+            band_dark = float(smooth.max())
+            best = int(np.where(smooth >= band_dark - 0.02)[0][-1])
+            band = strip[best:best + k]
+            qmask = qualified[best:best + k] > 0
+            band = band[qmask] if qmask.any() else band
+        else:
+            band = strip
+            band_dark = float(qualified.mean())
+        band_bright = float(np.mean(band > 140))
+        m = {"chat_band": band_dark, "chat_wod": wod,
+             "chat_bright": band_bright, "chat_pencil": pencil_best}
+        # 铅笔图标在位 → 面板铁定开（主题/亮度无关，打字中也照样开）
+        if pencil_best > cfg.chat_pencil_on:
+            return True, band_dark, m
         if band_dark > cfg.chat_band_on and len(qualified) > k:
-            # 主窗口（最靠下的并列极大窗）按原判据表态：
-            if band_bright > cfg.chat_band_text:
-                # 黑带里全是白字：气泡（面板可能关着）或打字中（面板开着）
-                return None, 0.5, m
-            if band_bright > cfg.chat_band_bright:
-                # 铅笔图标/占位文字的亮点是输入框的身份证（实测 开=0.016/0.003）
-                # 但必须同时有消息区暗底白字佐证，防止暗场景地面/UI误判
-                if wod > cfg.chat_wod_support:
-                    return True, band_dark, m
-                else:
-                    # 没有消息区佐证，可能是暗场景误判，不表态
-                    return None, 0.5, m
-            # 主窗无斑点 → 两种可能：①暗场景地面/水面（07-03 遇境黑夜误判开的
-            # 根源，夜景星光只污染消息区 wod、污染不了条带）；②输入框在上方，
-            # 被下方并列的暗地面抢走了主窗。自下而上扫其余满宽暗窗找输入框：
+            # 无铅笔：检查满宽暗带里是否有白字（气泡/打字）。
+            # 铅笔扫描已覆盖所有纵向位置，这里只看整带白字。
             idxs = np.where(smooth >= cfg.chat_band_on)[0]
-            brs = []
             for i in idxs:
                 wwin = strip[i:i + k]
                 qm = qualified[i:i + k] > 0
-                bw = wwin[qm] if qm.any() else wwin
-                brs.append(float(np.mean(bw > 140)))
-            # 白字窗（打字中/气泡）的位置：紧挨着它的"干净小窗"只是打字框的
-            # 边沿缝隙，不能当输入框（否则打字否决被钻空子）
-            text_pos = [i for i, br in zip(idxs, brs) if br > cfg.chat_band_text]
-            for i, br in sorted(zip(idxs, brs), reverse=True):   # 自下而上
-                if (cfg.chat_band_bright < br <= cfg.chat_band_text
-                        and all(abs(int(i) - int(j)) >= k for j in text_pos)):
-                    m["chat_bright"] = br
-                    # 同样需要消息区暗底白字佐证
-                    if wod > cfg.chat_wod_support:
-                        return True, band_dark, m
-                    else:
-                        return None, 0.5, m
-            if text_pos:
-                return None, 0.5, m      # 只有打字/气泡窗 → 不表态
-            m["chat_bright"] = 0.0
-            # 满宽暗带遍布却无一有图标亮点 → 暗场景地面，面板是关的
+                b = wwin[qm] if qm.any() else wwin
+                if float(np.mean(b > 140)) > cfg.chat_band_text:
+                    # 黑带里全是白字：气泡（面板可能关）或打字中（面板开），无法区分
+                    return None, 0.5, m
+            # 满宽暗带遍布却无铅笔图标 → 暗场景地面，面板关
             # （不回 None：否则暗图里状态永远冻结，守门永远不开面板）
+            m["chat_bright"] = 0.0
             return False, 0.9, m
         if band_dark < cfg.chat_band_off:
             frame_mean = float(gray_full[::4, ::4].mean())
@@ -1059,14 +1219,9 @@ class PanelDetector:
                     mx_r = float(smooth_r.max())
                     m["chat_rel"] = mx_r
                     if mx_r > cfg.chat_band_on:
-                        best_r = int(np.where(smooth_r >= mx_r - 0.02)[0][-1])
-                        win_r = strip[best_r:best_r + k]
-                        qm_r = qual_r[best_r:best_r + k] > 0
-                        band_r = win_r[qm_r] if qm_r.any() else win_r
-                        # 佐证：框内铅笔图标/占位文字的亮点（实测 231 的白色像素）
-                        if float(np.mean(band_r > 140)) > cfg.chat_band_bright:
-                            return True, mx_r, m
-                        return None, 0.5, m   # 有满宽灰条但无图标亮点 → 存疑
+                        # 浅色面板的铅笔图标已在前面的全 strip 扫描覆盖；
+                        # 走到这里说明无铅笔，不凭弱亮点判开，存疑
+                        return None, 0.5, m
             return False, 1.0 - band_dark, m
         return None, 0.0, m
 
@@ -1122,7 +1277,7 @@ class PanelDetector:
             scale = 2
         else:
             scale = 1
-        result, _ = self._ensure_ocr_engine()(img)
+        result, _ = ocr_infer(self._ensure_ocr_engine(), img)
         items = []
         for r in result or []:
             box, text, conf = r[0], str(r[1]), float(r[2])
@@ -1266,23 +1421,43 @@ class PanelDetector:
     def _make_grabber(self):
         """优先 DXGI 桌面复制（OBS 游戏捕获同原理，对游戏零干扰），
         bettercam 是 dxcam 的维护版分支、接口相同，谁装了用谁。
-        都不可用则回退 mss/GDI。返回 grab(region)->BGR ndarray | None(画面无变化)。"""
+        都不可用则回退 mss/GDI。返回 grab(region)->BGR ndarray | None(画面无变化)。
+
+        region 坐标系见文件里 _pick_output 上方的说明：DXGI 要的是「相对所选输出」的
+        坐标，而调用方给的是绝对桌面坐标。这里负责映射，并按区域缓存选中的输出
+        （窗口拖动/缩放后 self._region 会变，key 一变就重新选，所以换屏也能跟上）。
+        """
         for mod_name in ("bettercam", "dxcam"):
             try:
                 mod = __import__(mod_name)
-                cam = mod.create(output_color="BGR")
-                if cam is None:
-                    raise RuntimeError(f"{mod_name}.create 返回 None")
+                outs = _enum_dxgi_outputs(mod)
+                if not outs:
+                    raise RuntimeError("枚举不到带桌面矩形的输出设备")
+                print("  [PD-Sense] 截屏后端: %s/DXGI（对游戏零干扰，%d 块屏）"
+                      % (mod_name, len(outs)))
+                state = {"key": None, "cam": None, "rect": None}
 
-                def grab(region):
-                    l, t = region["left"], region["top"]
-                    f = cam.grab(region=(l, t, l + region["width"], t + region["height"]))
-                    return f  # None = 这一瞬画面没变化，沿用上一帧即可
+                def grab(region, _outs=outs, _state=state):
+                    l, t = int(region["left"]), int(region["top"])
+                    r, b = l + int(region["width"]), t + int(region["height"])
+                    key = (l, t, r, b)
+                    if _state["key"] != key:
+                        hit = _pick_output(_outs, l, t, r, b)
+                        if hit is None:
+                            # 跨屏/被切边的区域 DXGI 抓不了：抛出去让 _sense_loop 计数，
+                            # 连抛 3 次会永久切回 GDI（宁可慢也不能对着错位的画面判断）
+                            raise RuntimeError(
+                                "区域 (%d,%d,%d,%d) 不在任何单块屏幕内（跨屏或被切边），"
+                                "DXGI 抓不了" % (l, t, r, b))
+                        _state["key"] = key
+                        _state["cam"] = hit[0]
+                        _state["rect"] = hit[1]
+                    return _state["cam"].grab(
+                        region=_to_output_relative(_state["rect"], l, t, r, b))
 
-                print(f"  [PD-Sense] 截屏后端: {mod_name}/DXGI（对游戏零干扰）")
                 return grab
             except Exception as e:
-                print(f"  [PD-Sense] {mod_name} 不可用: {e}")
+                print("  [PD-Sense] %s 不可用: %s" % (mod_name, e))
         return self._make_mss_grabber()
 
     def _sense_loop(self):

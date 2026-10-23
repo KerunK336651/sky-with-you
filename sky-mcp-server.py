@@ -283,22 +283,69 @@ class PcSkyController:
 
     def _game_is_foreground(self) -> bool:
         """开发板是真键盘，按键会进当前前台窗口。游戏不在前台时必须拒绝按键，
-        否则会把 C / Ctrl+V 按进 Aki 的桌面（2026-07-03 两次'整机卡死'的元凶）。"""
-        # SKY_SKIP_FOCUS=1 时跳过前台检查（Arduino 硬件模式下可用）
+        否则会把 C / Ctrl+V 按进 Aki 的桌面（2026-07-03 两次'整机卡死'的元凶）。
+
+        2026-10-20 修（P0）：`strict=True` 时**忽略** SKY_SKIP_FOCUS 旁路，做真实前台
+        校验。SKY_SKIP_FOCUS=1 原本的含义是"不抢焦点"（不 activate 窗口），但它同时把
+        `press_key` / `ensure_game_foreground` 的校验也一并旁路了 —— 于是 Arduino 真键盘
+        会把 Ctrl+V 粘进用户正在编辑的文件。现在拆开：跳过"抢焦点"，但不跳过"校验"。
+        """
         import os
-        if os.environ.get("SKY_SKIP_FOCUS", "0") == "1":
+        if os.environ.get("SKY_SKIP_FOCUS", "0") == "1" and not self._focus_strict():
             return True
         if sys.platform != "win32":
             return True
         try:
             import ctypes
+            from ctypes import wintypes
             u32 = ctypes.windll.user32
+            fg_hwnd = u32.GetForegroundWindow()
             buf = ctypes.create_unicode_buffer(256)
-            u32.GetWindowTextW(u32.GetForegroundWindow(), buf, 256)
+            u32.GetWindowTextW(fg_hwnd, buf, 256)
             title = buf.value
-            return any(title.startswith(p) for p in self.GAME_TITLE_PREFIXES)
+            # 1) 标题前缀匹配（游戏主窗口 TgcMainWindow，标题"光·遇"）
+            if any(title.startswith(p) for p in self.GAME_TITLE_PREFIXES):
+                return True
+            # 2) 进程匹配：按 enter 打开聊天输入框时，游戏会激活一个无标题的
+            #    TgcDialogClass 对话框（屏幕外，承载 IME），它属于游戏进程、按键安全；
+            #    只按标题会误判为"不在前台"。
+            fg_pid = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(fg_hwnd, ctypes.byref(fg_pid))
+            game_pid = self._game_pid()
+            if game_pid and fg_pid.value == game_pid:
+                return True
+            return False
         except Exception:
             return True  # 检查本身失败时不拦截，避免误伤
+
+    def _fg_title(self) -> str:
+        """返回当前前台窗口标题（仅用于错误信息 / 诊断，便于定位误判）。"""
+        try:
+            info = self._foreground_window()
+            return info.get("title", "") if info else ""
+        except Exception:
+            return ""
+
+    def _game_pid(self) -> int | None:
+        """游戏主窗口（TgcMainWindow）的进程ID。"""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            win_info = self.find_window()
+            if not win_info:
+                return None
+            import pygetwindow as gw
+            matches = gw.getWindowsWithTitle(win_info["title"])
+            if not matches:
+                return None
+            hwnd = self._window_handle(matches[0])
+            if not hwnd:
+                return None
+            pid = wintypes.DWORD()
+            ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            return int(pid.value) if pid.value else None
+        except Exception:
+            return None
 
     def _drop_arduino(self) -> None:
         """断开串口。下次指令重开串口时 DTR 会触发板子复位 → 固件重启自动松开所有键。"""
@@ -314,7 +361,8 @@ class PcSkyController:
         # 板子解析出乱码指令，最坏情况把 Ctrl 等键永久卡死（键盘鼠标全瘫）。
         # 任何异常/坏应答一律断开串口，靠重连复位自愈。
         if not self._game_is_foreground():
-            raise SkyError("游戏不在前台，拒绝按键（安全保护：防止按进桌面/其他窗口）")
+            raise SkyError("游戏不在前台，拒绝按键（安全保护：防止按进桌面/其他窗口）"
+                          f"。当前前台窗口=「{self._fg_title()}」")
         with self._serial_lock:
             try:
                 s = self._ensure_arduino()
@@ -440,51 +488,29 @@ class PcSkyController:
         user32 = ctypes.windll.user32
         kernel32 = ctypes.windll.kernel32
         sw_restore = 9
-        hwnd_topmost = -1
-        hwnd_notopmost = -2
-        swp_no_move = 0x0002
-        swp_no_size = 0x0001
-        swp_show_window = 0x0040
-        vk_menu = 0x12
-        keyeventf_keyup = 0x0002
 
-        user32.ShowWindow(hwnd, sw_restore)
-        user32.SetWindowPos(hwnd, hwnd_topmost, 0, 0, 0, 0, swp_no_move | swp_no_size | swp_show_window)
-        user32.SetWindowPos(hwnd, hwnd_notopmost, 0, 0, 0, 0, swp_no_move | swp_no_size | swp_show_window)
-        user32.BringWindowToTop(hwnd)
+        # 用 AttachThreadInput 把当前线程的输入队列与前台/目标线程绑定，
+        # 绑定后 SetForegroundWindow 不受"仅最近输入进程可抢前台"限制。
+        # 不模拟 ALT（会触发"任务切换"）、不切 topmost（会闪窗）。
+        foreground_hwnd = user32.GetForegroundWindow()
+        foreground_pid = wintypes.DWORD()
+        target_pid = wintypes.DWORD()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(foreground_pid))
+        target_thread = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(target_pid))
+        current_thread = kernel32.GetCurrentThreadId()
 
-        user32.keybd_event(vk_menu, 0, 0, 0)
-        user32.SetForegroundWindow(hwnd)
-        user32.keybd_event(vk_menu, 0, keyeventf_keyup, 0)
-        time.sleep(0.05)
-
-        foreground = self._foreground_window()
-        if foreground and foreground.get("hwnd") == hwnd:
-            return
-
+        attached = set()
+        for thread_id in {foreground_thread, target_thread, current_thread}:
+            if thread_id and user32.AttachThreadInput(current_thread, thread_id, True):
+                attached.add(thread_id)
         try:
-            foreground_hwnd = user32.GetForegroundWindow()
-            foreground_pid = wintypes.DWORD()
-            target_pid = wintypes.DWORD()
-            foreground_thread = user32.GetWindowThreadProcessId(foreground_hwnd, ctypes.byref(foreground_pid))
-            target_thread = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(target_pid))
-            current_thread = kernel32.GetCurrentThreadId()
-
-            for thread_id in {foreground_thread, target_thread}:
-                if thread_id:
-                    user32.AttachThreadInput(current_thread, thread_id, True)
-            try:
-                user32.ShowWindow(hwnd, sw_restore)
-                user32.BringWindowToTop(hwnd)
-                user32.SetActiveWindow(hwnd)
-                user32.SetFocus(hwnd)
-                user32.SetForegroundWindow(hwnd)
-            finally:
-                for thread_id in {foreground_thread, target_thread}:
-                    if thread_id:
-                        user32.AttachThreadInput(current_thread, thread_id, False)
-        except Exception:
-            pass
+            user32.ShowWindow(hwnd, sw_restore)
+            user32.BringWindowToTop(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            for thread_id in attached:
+                user32.AttachThreadInput(current_thread, thread_id, False)
 
     def _window_handle(self, win) -> int | None:
         hwnd = getattr(win, "_hWnd", None) or getattr(win, "hWnd", None)
@@ -523,10 +549,19 @@ class PcSkyController:
                 }
         return None
 
-    def focus_game(self) -> dict[str, Any]:
-        # Arduino 硬件模式下可跳过前台检查（用户自己确保游戏在前台）
+    def _focus_strict(self) -> bool:
+        """是否启用"严格前台校验"（默认开）。即使 SKY_SKIP_FOCUS=1（不抢焦点），
+        按键前仍会校验游戏是否真在前台，不在就拒绝按 —— 设 SKY_FOCUS_STRICT=0 回退旧行为。"""
         import os
-        if os.environ.get("SKY_SKIP_FOCUS", "0") == "1":
+        return os.environ.get("SKY_FOCUS_STRICT", "1") != "0"
+
+    def focus_game(self, force: bool = False) -> dict[str, Any]:
+        # Arduino 硬件模式下可跳过"抢焦点"（用户自己确保游戏在前台）；
+        # 但"校验是否在前台"不再一并跳过（SKY_FOCUS_STRICT，见 _game_is_foreground）。
+        # force=True 时（如 send_chat 发送前）忽略 SKY_SKIP_FOCUS，必须把游戏拉到前台，
+        # 否则发送那一刻焦点不在游戏，只会被拒绝、不会自动拉前台。
+        import os
+        if os.environ.get("SKY_SKIP_FOCUS", "0") == "1" and not force:
             win_info = self.find_window()
             if win_info:
                 return {**win_info, "focused": True, "foreground": None}
@@ -544,31 +579,39 @@ class PcSkyController:
             raise SkyError("Sky window disappeared before focus.")
         win = matches[0]
         hwnd = self._window_handle(win)
+        # 快速路径：游戏已经在前台就直接返回，不做 activate / 强制前台 / 点击窗口中心等
+        # 任何抢焦点动作，避免多余操作（尤其点击画面中心）反而干扰当前焦点。
+        if sys.platform.startswith("win") and hwnd:
+            _now_fg = self._foreground_window()
+            if _now_fg and _now_fg.get("hwnd") == hwnd:
+                return {**win_info, "focused": True, "foreground": _now_fg}
         if win.isMinimized:
             win.restore()
+        # 直接用 AttachThreadInput 拉前台（本地实测稳定可靠），不先 win.activate()
+        # （pygetwindow 的 activate 会先做一次受限的 SetForegroundWindow，反而引入竞态）。
+        if sys.platform.startswith("win") and hwnd:
+            foreground = None
+            for attempt in range(2):
+                self._force_foreground_window(hwnd)
+                time.sleep(0.12)
+                foreground = self._foreground_window()
+                if foreground and foreground.get("hwnd") == hwnd:
+                    break
+            # 最后手段：软件点击窗口中心
+            if not foreground or foreground.get("hwnd") != hwnd:
+                self._click_window_center(win_info)
+                time.sleep(0.15)
+                foreground = self._foreground_window()
+            if foreground and foreground.get("hwnd") != hwnd:
+                raise SkyError(
+                    f"Sky window found but not focused. Foreground window is: {foreground.get('title')}")
+            return {**win_info, "focused": True, "foreground": foreground}
+        # 非 Windows 回退：pygetwindow activate
         try:
             win.activate()
         except Exception as exc:
-            if not (sys.platform.startswith("win") and hwnd):
-                raise SkyError(f"Failed to activate Sky window: {exc}") from exc
-            try:
-                import ctypes
-                user32 = ctypes.windll.user32
-                user32.ShowWindow(hwnd, 9)
-                user32.SetForegroundWindow(hwnd)
-            except Exception as fallback_exc:
-                raise SkyError(f"Failed to activate Sky window: {fallback_exc}") from fallback_exc
-        if sys.platform.startswith("win") and hwnd:
-            self._force_foreground_window(hwnd)
-        time.sleep(0.15)
-        foreground = self._foreground_window()
-        if sys.platform.startswith("win") and hwnd and (not foreground or foreground.get("hwnd") != hwnd):
-            self._click_window_center(win_info)
-            time.sleep(0.15)
-            foreground = self._foreground_window()
-        if sys.platform.startswith("win") and hwnd and foreground and foreground.get("hwnd") != hwnd:
-            raise SkyError(f"Sky window found but not focused. Foreground window is: {foreground.get('title')}")
-        return {**win_info, "focused": True, "foreground": foreground}
+            raise SkyError(f"Failed to activate Sky window: {exc}") from exc
+        return {**win_info, "focused": True, "foreground": self._foreground_window()}
 
     def ensure_game_foreground(self) -> dict[str, Any]:
         # Arduino 硬件模式下可跳过前台检查
@@ -596,6 +639,12 @@ class PcSkyController:
 
     def press_key(self, key: str, duration_ms: int = 80, backend: str | None = None) -> str:
         self.focus_game()
+        # 严格前台校验：SKY_SKIP_FOCUS=1 只表示"不抢焦点"，不代表"可以打到别的窗口"。
+        # Arduino 是真 USB 键盘，一旦前台不是光遇，这次按键会打进用户当前窗口。
+        if self._focus_strict() and not self._game_is_foreground():
+            raise SkyError("Sky window is not foreground: refusing to press key "
+                           "(set SKY_FOCUS_STRICT=0 to restore the unsafe behaviour)"
+                           f". 当前前台窗口=「{self._fg_title()}」")
         key = normalize_key(key)
         resolved = self._resolve_input_backend_name(backend)
         if resolved == "gamepad":
@@ -663,7 +712,7 @@ class PcSkyController:
         if assume_open:
             self.ensure_game_foreground()
         else:
-            self.focus_game()
+            self.focus_game(force=True)
             resolved = self._resolve_input_backend_name(backend)
             if resolved == "arduino":
                 kc = self.ARDUINO_KEY_MAP.get(normalize_key(open_key), 176)
@@ -671,6 +720,11 @@ class PcSkyController:
             else:
                 self._tap_key(open_key, enter_tap_ms, backend=backend)
             time.sleep(max(0, open_delay_ms) / 1000)
+        # 前台不是光遇时，下面的 Ctrl+V 会把聊天内容粘进用户正在编辑的窗口
+        if self._focus_strict() and not self._game_is_foreground():
+            raise SkyError("Sky window is not foreground: refusing to send chat "
+                           "(Ctrl+V would paste into another window; SKY_FOCUS_STRICT=0 to override)"
+                           f". 当前前台窗口=「{self._fg_title()}」")
         self._paste_text(message, backend=backend)
         if send:
             resolved_send = self._resolve_input_backend_name(backend)
@@ -891,7 +945,13 @@ TOOLS = [
     {
         "name": "focus_game",
         "description": "Bring the Sky PC window to the foreground.",
-        "inputSchema": {"type": "object", "properties": {}},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "force": {"type": "boolean",
+                          "description": "Ignore SKY_SKIP_FOCUS and force the window to the foreground."}
+            },
+        },
     },
     {
         "name": "press_key",
@@ -971,7 +1031,9 @@ class McpServer:
         if name == "status":
             return {"content": text_content(json.dumps(self.controller.status(), ensure_ascii=False, indent=2))}
         if name == "focus_game":
-            return {"content": text_content(json.dumps(self.controller.focus_game(), ensure_ascii=False, indent=2))}
+            return {"content": text_content(json.dumps(
+                self.controller.focus_game(force=bool(arguments.get("force", False))),
+                ensure_ascii=False, indent=2))}
         if name == "press_key":
             result = self.controller.press_key(
                 arguments["key"],

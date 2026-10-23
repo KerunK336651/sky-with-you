@@ -2,11 +2,20 @@
 numpy
 opencv-python
 mss
+# DXGI 桌面复制截屏（OBS 游戏捕获同原理）。**强烈建议装**：
+# 不装就退回 mss/GDI BitBlt，而每次 BitBlt 都会让显卡停顿一下、游戏偶尔掉帧
+# （doctor.py 会警告）。实测每帧约 3 ms，对游戏零干扰。
+# panel_detector 会自动选：bettercam -> dxcam -> mss/GDI；两者接口相同，谁装了用谁。
+# 注意：DXGI 的 region 是「相对所选显示器左上角」的坐标，多屏/负坐标的适配见
+# panel_detector 里 _pick_output 上方的说明（2026-10-06 真机踩过，写死绝对坐标会连抛异常并被永久切回 GDI）。
+bettercam; platform_system == "Windows"
 rapidocr_onnxruntime
 # 可选：OCR GPU 加速（DirectML，AMD/N卡/核显通用，实测提速约 3 倍，缓解多人卡死）。
 # 安装后会替换 CPU 版 onnxruntime：pip install onnxruntime-directml
-# 不装也能用（CPU 较慢）；环境变量 SKY_OCR_DEVICE=auto/dml/cpu 控制（默认 auto）
-#
+# 不装也能用（CPU 较慢）；环境变量 SKY_OCR_DEVICE=auto/dml/cpu 控制（默认 auto）。
+# 实测（RX 5600 XT）：v5 在 DML 上中位数 162 ms、CPU 224 ms（约 1.38 倍）。
+# 另注意：本项目默认把多路 OCR 推理串行化（SKY_OCR_SERIALIZE，默认 1）——
+# 3 个引擎 / 6 个 DirectML 会话并发时曾在真机把 AMD 驱动写崩（0xC0000005，见交接文档第三十二~三十三章）。
 # OCR 模型版本（环境变量 SKY_OCR_MODEL=v3/v5，默认 v3）：
 #   v3 = RapidOCR 自带模型；v5 = PP-OCRv5（models/ocr 已随仓库附带，行切分更干净、
 #   支持简繁/拼音/日文）。一键用 v5 跑 start_loop_v5.bat；模型文件缺失会自动回退 v3。

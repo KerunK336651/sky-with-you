@@ -210,23 +210,27 @@ def make_state():
         my_words=[], search_cache={}, search_knowledge=[],
         style_checked=True, style_knowledge={},          # True：跳过会联网的风格学习
         is_holding_hands=False, pose_state="standing",
-        pose_need_retry=False, pose_last_target="", gohome_completed=False)
+        pose_need_retry=False, pose_last_target="", gohome_completed=False,
+        pending_invites={})
 
 
 def run_ai_loop(script, msgs_list, vision, expect_items=1, extra_wait=0.4):
     """跑真 ai_loop（临时线程），返回 (action_q 收到的东西, 捕获的输出, FakeLLM)。"""
     M.shutdown_event.clear()
-    saved = (M._vision, M.add_turn, M._maybe_update_memory)
+    saved = (M._vision, M.add_turn, M._maybe_update_memory, M._save_conversation)
     M._vision = vision
     M.add_turn = lambda memory, p, c: memory                  # 绝不写 user_data/memory.json
     M._maybe_update_memory = lambda state, llm, force=False: None
+    # 记忆 v4：ai_loop 里的对话窗口持久化也要 no-op，绝不写 user_data/conversation.json
+    M._save_conversation = lambda conv: None
     out = io.StringIO()
     llm = FakeLLM(script)
     try:
         state = make_state()
         ai_q, action_q = queue.Queue(maxsize=4), queue.Queue(maxsize=8)
+        interact_q = queue.Queue(maxsize=8)   # Delta B1：本测试走玩家消息路径，保持空
         det = SimpleNamespace(latest_frame=lambda: FRAME)
-        t = threading.Thread(target=M.ai_loop, args=(det, state, ai_q, action_q, llm), daemon=True)
+        t = threading.Thread(target=M.ai_loop, args=(det, state, ai_q, action_q, llm, interact_q), daemon=True)
         with contextlib.redirect_stdout(out):
             t.start()
             for one in msgs_list:
@@ -246,7 +250,7 @@ def run_ai_loop(script, msgs_list, vision, expect_items=1, extra_wait=0.4):
         return items, out.getvalue(), llm
     finally:
         M.shutdown_event.clear()
-        M._vision, M.add_turn, M._maybe_update_memory = saved
+        M._vision, M.add_turn, M._maybe_update_memory, M._save_conversation = saved
 
 
 # 2a. 模型直接回复：不该调用工具

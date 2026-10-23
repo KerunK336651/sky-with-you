@@ -5,9 +5,17 @@ Ported from sky-companion ocr_agent.py style-learning methods.
 When the personality prompt contains keywords like 病恋/病娇/虚恋/抖音/参考风格,
 this module searches the web for public style references and asks the LLM
 to distill a speaking-style prompt (with safety filters built in).
+
+2026-10-19 新增 player_style_profile()：从玩家真实对话（raw_turns）统计说话
+习惯（句长/语气词/问句比例/高频口头禅），生成给 AI 看的本地画像。零联网零 LLM，
+每条消息实时计算（最多80条素材，开销可忽略）。
 """
 import hashlib
 import re
+from collections import Counter
+
+
+_TONE_CHARS = "呀啦嘛哈嘿嗯哦欸诶呜哇呐捏咯咧噻嘛"
 
 
 def _clean_text(txt):
@@ -21,6 +29,77 @@ def style_prompt_key(personality_prompt):
     """
     raw = (personality_prompt or "").strip()
     return hashlib.sha256(raw.encode("utf-8", errors="ignore")).hexdigest()[:24]
+
+
+def player_style_profile(raw_turns, min_turns=8, limit=60):
+    """从玩家真实消息统计说话习惯，生成一段给 AI 看的画像文本。
+
+    Args:
+        raw_turns: memory.json 的 raw_turns 列表（每项 {"player":..., "companion":...}）。
+        min_turns: 素材少于此条数时返回空（样本太少统计不可靠）。
+        limit:     最多取最近多少条玩家消息做统计。
+
+    Returns:
+        str: 画像文本（句长习惯/语气词/问句比例/高频口头禅），或 ""。
+    """
+    try:
+        texts = []
+        for t in (raw_turns or []):
+            s = str(t.get("player", "") or "").strip() if isinstance(t, dict) else ""
+            if len(s) >= 2:
+                texts.append(s)
+        texts = texts[-limit:]
+        if len(texts) < min_turns:
+            return ""
+
+        # 句长习惯
+        lens = [len(re.sub(r"\s", "", t)) for t in texts]
+        avg = sum(lens) / len(lens)
+        if avg <= 10:
+            length_desc = "说话很短，常常一两个字一句"
+        elif avg <= 20:
+            length_desc = "短句为主"
+        elif avg <= 35:
+            length_desc = "句子中等长度"
+        else:
+            length_desc = "喜欢一次说比较长的话"
+
+        parts = [f"TA习惯{length_desc}（平均约{avg:.0f}字）"]
+
+        # 语气词偏好
+        tone_counter = {}
+        for t in texts:
+            for ch in set(t):
+                if ch in _TONE_CHARS:
+                    tone_counter[ch] = tone_counter.get(ch, 0) + 1
+        top_tones = [c for c, n in sorted(tone_counter.items(), key=lambda x: -x[1]) if n >= 3][:4]
+        if top_tones:
+            parts.append("常带语气词「" + "」「".join(top_tones) + "」")
+
+        # 问句 / 感叹比例
+        q_ratio = sum(1 for t in texts if "？" in t or "?" in t) / len(texts)
+        if q_ratio >= 0.3:
+            parts.append(f"爱用问句（约{int(q_ratio * 100)}%）")
+        excl_ratio = sum(1 for t in texts if "！" in t or "!" in t) / len(texts)
+        if excl_ratio >= 0.25:
+            parts.append("情绪外露，爱用感叹号")
+
+        # 高频口头禅（中文二字组，过滤语气词字）
+        bg = Counter()
+        for t in texts:
+            for i in range(len(t) - 1):
+                b = t[i:i + 2]
+                if all("\u4e00" <= c <= "\u9fff" for c in b) and not any(c in _TONE_CHARS for c in b):
+                    bg[b] += 1
+        phrases = [w for w, n in bg.most_common(12) if n >= 3][:3]
+        if phrases:
+            parts.append("常说「" + "」「".join(phrases) + "」")
+
+        if len(parts) <= 1:
+            return ""
+        return "；".join(parts) + "。回复时贴合TA的节奏就好，不用刻意模仿TA的用词。"
+    except Exception:
+        return ""
 
 
 def style_search_queries(personality_prompt):
