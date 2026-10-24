@@ -101,8 +101,15 @@ python -m pip install -r requirements.txt
    标注后训练。基础模型 `yolov8n.pt` 由 ultralytics 首次运行自动下载。
    不装 YOLO 也能靠模板匹配正常运行。
 
+   **作者署名与完整性校验**：官方权重内嵌作者署名（`.pt` 的 `_attribution` 字段，
+   记录作者 KerunK336651、来源仓库、CC BY-NC-SA 4.0 许可与发布版本），
+   并附 `models/yolo/SHA256SUMS.txt`。下载后可校验是否为官方未篡改版本：
+   `py tools/hash_models.py models/yolo --check`；给自己新训练的权重延续署名：
+   `py tools/stamp_model.py 权重路径.pt --release vX.X`。
+
    > **安全提示**：`.pt` 基于 pickle，加载时可执行代码。请只使用本仓库
-   > 内的权重，不要使用第三方网盘、群文件或不明链接里的 `best.pt`。
+   > 或 Release 页的权重，不要使用第三方网盘、群文件或不明链接里的 `best.pt`，
+   > 并先用上面的 SHA256 校验。
 
 ## 启动（两个终端）
 
