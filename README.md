@@ -1,5 +1,7 @@
 # sky-with-you
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.23618715.svg)](https://doi.org/10.5281/zenodo.23618715)
+
 让小机陪着你玩光遇。
 
 在《光·遇》(Sky: Children of the Light) PC 版里，给你的 AI 伴侣装一个身体。
@@ -177,6 +179,26 @@ YOLO 视觉识别、动作（牵手 / 坐下 / 抱抱 / 回遇境）逻辑；调
 移植了 sky-companion 聊天引擎并持续迭代。
 
 再次感谢 akinia0315、112Alan、Aevella 三位作者的原始工作。
+
+## 引用与存档
+
+每个 Release 都在 [Zenodo](https://zenodo.org)（CERN 托管的学术存档平台）做了不可篡改的第三方存档，并分配 DOI。
+
+- **概念 DOI（始终指向最新版本，推荐引用）**：[10.5281/zenodo.23618715](https://doi.org/10.5281/zenodo.23618715)
+- **v1.0 版本 DOI**：[10.5281/zenodo.23618716](https://doi.org/10.5281/zenodo.23618716)
+
+归档内容为该 Release 对应的 GitHub 源码快照（含随仓库发布的 YOLO 权重）。引用时可使用：
+
+```bibtex
+@software{kerunk_sky_with_you,
+  author = {KerunK336651 (珂珂)},
+  title  = {sky-with-you: 光遇 AI 伴侣「星河」},
+  url    = {https://github.com/KerunK336651/sky-with-you},
+  doi    = {10.5281/zenodo.23618715}
+}
+```
+
+> 权重文件另有内嵌作者署名（`.pt` 的 `_attribution` 字段）与 SHA256 校验，见上文「作者署名与完整性校验」。
 
 ## 作者的话
 
