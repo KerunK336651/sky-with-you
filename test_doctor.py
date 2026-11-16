@@ -71,6 +71,10 @@ def green_http(url, payload, token):
 class FakeProbes(doc.Probes):
     """把 doctor 碰环境的所有探针换成可控数据；默认值 = 一个全绿环境。"""
 
+    def mcp_token(self):
+        # 单测不读真实 user_data/mcp_token.txt；给一个固定 token，缺省即全绿
+        return (self.env.get("SKY_MCP_TOKEN") or "tok_test").strip()
+
     def __init__(self, root="X:/proj", env=None, python=(3, 13, 3, 64, "win32"),
                  modules=None, files=None, dirs=None, ports=None, window=GOOD_WINDOW,
                  tcp=(True, ""), http=None, bad_compile=(), io_error=(),
@@ -360,7 +364,8 @@ def _http_401_on_status(url, payload, token):
     return 401, None, "HTTP 401"
 
 
-rep, _, _ = run(FakeProbes(http=_http_401_on_status))
+rep, _, _ = run(FakeProbes(env={"SKY_MCP_TOKEN": "tok_test"},
+                           http=_http_401_on_status))
 expect("MCP token 不匹配 -> 警告", has_warn(rep, "token 不匹配"))
 
 
@@ -396,7 +401,7 @@ rep, _, _ = run(FakeProbes(env={"SKY_WHITELIST": ","}))
 expect("白名单为空 -> 警告", has_warn(rep, "为空"))
 
 rep, _, _ = run(FakeProbes(env={"SKY_MEM_READER": "1"}))
-expect("内存读取模式 -> 警告封号风险", has_warn(rep, "封号风险"))
+expect("内存读取已移出运行时 -> 警告仅研究", has_warn(rep, "仅研究"))
 
 rep, _, _ = run(FakeProbes(env={"SKY_INPUT_BACKEND": "pydirectinput"}))
 expect("软件按键后端 -> 警告可能不生效", has_warn(rep, "Raw Input"))

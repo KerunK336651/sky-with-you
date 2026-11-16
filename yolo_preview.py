@@ -12,8 +12,9 @@ yolo_preview.py — 独立 YOLO 实时预览窗口（纯查看，绝不按键）
   F9 用全局低级键盘钩子，游戏在前台也能捕获，且按键照常放行给游戏。
 
 环境变量（可选）：
-  SKY_YOLO_MODEL              模型路径（默认 22 类 v6 best.pt）
-  SKY_YOLO_CONF               置信度阈值（默认 0.80）
+  SKY_YOLO_MODEL              模型路径（默认 28 类 v8 best.pt；缺失回退 v7/v6）
+  SKY_YOLO_IMGSZ              推理尺寸（默认 960）
+  SKY_YOLO_CONF               置信度阈值（默认 0.50，和运行时一致）
   SKY_YOLO_PREVIEW_SCALE      显示缩放（默认 0.67）
   SKY_YOLO_PREVIEW_INTERVAL   推理间隔秒（默认 0.10，越小越吃 CPU）
   SKY_NEG_DIR                 困难负样本保存目录（默认 D:\\光遇互动采集\\hard_negative）
@@ -30,10 +31,15 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 os.chdir(ROOT)
 sys.path.insert(0, ROOT)
 
+_V8_MODEL = os.path.join(ROOT, "models", "yolo", "sky_v8_28cls_best.pt")
+_V7_MODEL = os.path.join(ROOT, "models", "yolo", "sky_v7_28cls_best.pt")
+_V6_MODEL = os.path.join(ROOT, "runs", "detect", "sky_v6_22cls", "weights", "best.pt")
 MODEL_PATH = os.environ.get(
     "SKY_YOLO_MODEL",
-    os.path.join(ROOT, "runs", "detect", "sky_v6_22cls", "weights", "best.pt"))
-CONF = float(os.environ.get("SKY_YOLO_CONF", "0.80"))
+    _V8_MODEL if os.path.exists(_V8_MODEL)
+    else _V7_MODEL if os.path.exists(_V7_MODEL) else _V6_MODEL)
+IMGSZ = int(os.environ.get("SKY_YOLO_IMGSZ", "960"))
+CONF = float(os.environ.get("SKY_YOLO_CONF", "0.50"))
 SCALE = float(os.environ.get("SKY_YOLO_PREVIEW_SCALE", "0.67"))
 INTERVAL = float(os.environ.get("SKY_YOLO_PREVIEW_INTERVAL", "0.10"))
 WIN = "Sky YOLO Preview  (q/ESC=quit)"
@@ -84,7 +90,9 @@ def save_negative(frame, idx):
 CN = {0: "聊天框", 1: "牵手", 2: "好友树", 3: "抱抱", 4: "背背", 5: "击掌",
       6: "碰拳", 7: "跟随", 8: "光翼", 9: "点火", 10: "聚焦", 11: "打坐",
       12: "熊抱", 13: "谢幕", 14: "花式击掌", 15: "握手", 16: "摸头",
-      17: "互火", 18: "打闹", 19: "搭肩", 20: "共舞", 21: "耳语"}
+      17: "互火", 18: "打闹", 19: "搭肩", 20: "共舞", 21: "耳语",
+      22: "乐器", 23: "设置菜单", 24: "引蝶", 25: "动作取消",
+      26: "公主抱", 27: "双人舞"}
 COLORS = {0: (170, 170, 170), 1: (0, 210, 0), 2: (255, 160, 0),
           3: (200, 0, 200), 4: (0, 150, 255), 5: (255, 200, 0),
           6: (60, 60, 255), 7: (255, 80, 180), 8: (0, 0, 255),
@@ -92,7 +100,15 @@ COLORS = {0: (170, 170, 170), 1: (0, 210, 0), 2: (255, 160, 0),
           12: (180, 0, 120), 13: (128, 0, 128), 14: (0, 200, 100),
           15: (160, 120, 0), 16: (200, 100, 255), 17: (0, 100, 255),
           18: (0, 0, 180), 19: (100, 100, 100), 20: (255, 0, 128),
-          21: (180, 200, 0)}
+          21: (180, 200, 0),
+          22: (0, 140, 255), 23: (80, 80, 255), 24: (0, 200, 200),
+          25: (140, 140, 0), 26: (255, 0, 80), 27: (0, 220, 120)}
+
+
+def _text_fill(bgr):
+    """浅色底用黑字、深色底用白字，保证任何类都能看到名字。"""
+    lum = 0.299 * bgr[2] + 0.587 * bgr[1] + 0.114 * bgr[0]
+    return (0, 0, 0) if lum > 170 else (255, 255, 255)
 
 
 def draw_frame(frame, boxes, names, font, fps, backend, neg_count=0, flash=False):
@@ -114,7 +130,7 @@ def draw_frame(frame, boxes, names, font, fps, backend, neg_count=0, flash=False
                 tw, th = tb[2] - tb[0], tb[3] - tb[1]
                 ly = max(0, int(y1) - th - 4)
                 d.rectangle([x1, ly, x1 + tw + 8, ly + th + 4], fill=rgb)
-                d.text((x1 + 4, ly + 1), label, fill=(255, 255, 255), font=font)
+                d.text((x1 + 4, ly + 1), label, fill=_text_fill(bgr), font=font)
             img = cv2.cvtColor(np.array(im), cv2.COLOR_RGB2BGR)
             pil_ok = True
         except Exception:
@@ -123,11 +139,11 @@ def draw_frame(frame, boxes, names, font, fps, backend, neg_count=0, flash=False
         for cls, cf, (x1, y1, x2, y2) in boxes:
             bgr = COLORS.get(cls, (255, 255, 255))
             cv2.rectangle(img, (int(x1), int(y1)), (int(x2), int(y2)), bgr, 2)
-            cv2.putText(img, "%s %.2f" % (names.get(cls, cls), cf),
+            cv2.putText(img, "%s %.2f" % (CN.get(cls, names.get(cls, str(cls))), cf),
                         (int(x1), max(15, int(y1) - 6)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, bgr, 2)
-    line1 = "YOLO conf>=%.2f | boxes:%d | fps:%.1f | backend:%s | hardneg:%d" % (
-        CONF, len(boxes), fps, backend, neg_count)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, _text_fill(bgr), 2)
+    line1 = "YOLO %s @%d conf>=%.2f | boxes:%d | fps:%.1f | backend:%s | hardneg:%d" % (
+        os.path.basename(MODEL_PATH), IMGSZ, CONF, len(boxes), fps, backend, neg_count)
     if flash:
         line2 = "F9 SAVED hard-negative #%d (raw frame)" % neg_count
         col2 = (0, 255, 0)
@@ -183,6 +199,7 @@ def main():
     print("加载模型：%s" % MODEL_PATH)
     model = YOLO(MODEL_PATH)
     names = model.names
+    print("类别数：%d | 推理尺寸：%d | 置信度：%.2f" % (len(names or {}), IMGSZ, CONF))
     print("类别：%s" % names)
 
     font = None
@@ -207,7 +224,7 @@ def main():
                 time.sleep(0.01)
                 continue
             try:
-                r = model(frame, conf=CONF, verbose=False)[0]
+                r = model(frame, conf=CONF, imgsz=IMGSZ, verbose=False)[0]
                 state["boxes"] = [
                     (int(b.cls[0]), float(b.conf[0]), tuple(map(float, b.xyxy[0])))
                     for b in r.boxes]

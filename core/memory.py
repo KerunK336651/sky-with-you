@@ -283,10 +283,18 @@ def update_profile(memory, profile_prompt):
         memory["profile_recent"] = new_recent[:PROFILE_RECENT_KEEP]
     memory["profile_prompt"] = _combined_profile(memory)
     memory["profile_updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-    memory["pending_turns"] = []
-    save_memory(memory)
+    # 顺序要紧：先落日记再清 pending。旧写法是先清 pending 再写日记，写盘一旦失败
+    # （磁盘/权限/JSON 异常）这批事件就永久丢了；现在写失败就保留 pending，下轮重试。
+    _diary_ok = True
     if diary_text:
-        add_diary_entry(diary_text)
+        try:
+            add_diary_entry(diary_text)
+        except Exception as e:
+            _diary_ok = False
+            print(f"  [Memory] 日记写入失败，保留 pending_turns 下轮重试: {e}")
+    if _diary_ok:
+        memory["pending_turns"] = []
+    save_memory(memory)
     return memory
 
 

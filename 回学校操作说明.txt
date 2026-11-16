@@ -81,7 +81,7 @@
 --------------------------------------------------------
 三、环境准备（三步）
 --------------------------------------------------------
-1. 解压到学校原来的目录 `C:\Users\86187\Desktop\sky-with-you-main`。
+1. 解压到学校原来的目录 `C:\Users\<你的用户名>\Desktop\sky-with-you-main`。
    ⚠ **不要整个覆盖**：
      - `key.txt` 用学校本地原有的（本包按规矩**不含密钥**）；
      - `user_data\` 先改名成 `user_data_学校旧备份` 再放本包的（本包带的是**家里**的记忆，
@@ -106,8 +106,8 @@
   * `ocr_real_shots\` 里的真实截图、根目录的 `debug*.png`
 
 拷法（在家里电脑上执行，U 盘改成你的盘符）：
-  xcopy /Y "C:\Users\kgklg\Desktop\sky-with-you-main\flip_debug\chat_2026*.jpg" "U:\sky帧\"
-  xcopy /Y "C:\Users\kgklg\Desktop\sky-with-you-main\logs\loop_2026*.txt" "U:\sky日志\"
+  xcopy /Y "C:\Users\<你的用户名>\Desktop\sky-with-you-main\flip_debug\chat_2026*.jpg" "U:\sky帧\"
+  xcopy /Y "C:\Users\<你的用户名>\Desktop\sky-with-you-main\logs\loop_2026*.txt" "U:\sky日志\"
 
 --------------------------------------------------------
 五、回家时带回来什么

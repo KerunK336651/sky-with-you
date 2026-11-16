@@ -16,7 +16,12 @@ import os
 import sys
 
 # ========== 配置 ==========
-MODEL_PATH = r"runs/detect/runs/detect/train/weights/best.pt"  # 训练好的模型路径
+ROOT = os.path.dirname(os.path.abspath(__file__))
+_V7_MODEL = os.path.join(ROOT, "models", "yolo", "sky_v7_28cls_best.pt")
+_V6_MODEL = os.path.join(ROOT, "runs", "detect", "sky_v6_22cls", "weights", "best.pt")
+# 默认 28 类 v7（缺失回退 v6 22 类）；可用 SKY_YOLO_MODEL 覆盖
+MODEL_PATH = os.environ.get(
+    "SKY_YOLO_MODEL", _V7_MODEL if os.path.exists(_V7_MODEL) else _V6_MODEL)
 GAME_WINDOW_TITLE = "光·遇"
 CONF_THRESHOLD = 0.75   # 置信度阈值，提高减少误检
 # ==========================

@@ -35,6 +35,7 @@ import re
 import sys
 import threading
 import queue
+import atexit
 from difflib import SequenceMatcher
 import numpy as np
 import cv2
@@ -45,6 +46,23 @@ from panel_detector import (PanelDetector, DetectorConfig, Screen,
 
 # ── 移植自 sky-companion 的核心模块 ──
 from core.llm_client import LLMClient
+from core.song_settings import (
+    load_settings as load_song_settings,
+    slot_key as song_slot_key,
+    kind_of as song_kind,
+    describe as describe_song_settings,
+    INSTRUMENT_KINDS as SONG_INSTRUMENT_KINDS,
+)
+from core.keybind_settings import (
+    act_keys as keybind_act_keys,
+    pose_key as keybind_pose_key,
+    describe as describe_keybind_settings,
+)
+from core.whitelist_settings import (
+    enabled_of as whitelist_enabled_of,
+    names_of as whitelist_names_of,
+    describe as describe_whitelist_settings,
+)
 from core.memory import (
     load_memory, add_turn, memory_prompt, needs_update, update_profile,
     companion_replies, memory_pending_turns, build_memory_update_prompt,
@@ -77,7 +95,125 @@ except Exception as _kb_imp_err:
 # ===================== 配置 =====================
 
 MCP_URL       = "http://127.0.0.1:9900"
-MCP_TOKEN     = "1234"
+
+# MCP 的 Bearer token（2026-11-01 P0：不再写死 1234）：
+#   SKY_MCP_TOKEN 环境变量 → user_data/mcp_token.txt（MCP 首次启动自动生成，两边读同一文件）。
+# 懒加载：MCP 可能比主循环晚启动，文件还没生成时最多等 5 秒；仍没有就空 token（会被 401 拒）。
+_MCP_TOKEN_CACHE = None
+
+
+def _mcp_token():
+    global _MCP_TOKEN_CACHE
+    if _MCP_TOKEN_CACHE is not None:
+        return _MCP_TOKEN_CACHE
+    tok = os.environ.get("SKY_MCP_TOKEN", "").strip()
+    if not tok:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "user_data", "mcp_token.txt")
+        for _ in range(50):          # 最多等 5 秒（MCP 启动时生成文件）
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    tok = f.read().strip()
+                if tok:
+                    break
+            except OSError:
+                pass
+            time.sleep(0.1)
+    if not tok:
+        print("  [MCP] ⚠ 没找到 token（先启动 MCP 生成 user_data/mcp_token.txt，"
+              "否则请求会被 401 拒绝）")
+    _MCP_TOKEN_CACHE = tok
+    return tok
+
+
+# ===================== 单实例锁（2026-11-01 P0） =====================
+# 同一台机开两个主循环会抢键盘、记忆/日记互相覆盖。用 user_data/loop.lock 的独占
+# 字节锁做单实例；进程崩溃时 OS 自动释放，不会留下死锁。
+_INSTANCE_LOCK_HANDLE = None
+_INSTANCE_LOCK_PATH = None
+
+
+def _read_lock_owner(path):
+    """读锁文件旁边的 .owner（独立小文件，不受字节锁影响）。"""
+    try:
+        with open(path + ".owner", "r", encoding="utf-8") as of:
+            return of.read(200).strip()
+    except OSError:
+        return ""
+
+
+def acquire_instance_lock(path):
+    """试着拿单实例锁。返回 (ok, holder)：ok=False 时 holder 是占用者写入的说明。"""
+    global _INSTANCE_LOCK_HANDLE, _INSTANCE_LOCK_PATH
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        f = open(path, "a+", encoding="utf-8")
+    except OSError as e:
+        print("  [Lock] 打不开锁文件（继续运行）：%s" % e)
+        return True, ""
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        # 锁被占用时锁区不可读（Windows LockFile 连 read 都拒），所以持有者信息
+        # 记在旁边的 .owner 文件里，不走锁区。
+        try:
+            f.close()
+        except OSError:
+            pass
+        return False, _read_lock_owner(path)
+    except Exception as e:
+        print("  [Lock] 锁机制不可用（继续运行）：%s" % e)
+        try:
+            f.close()
+        except OSError:
+            pass
+        return True, ""
+    info = "pid=%d start=%s" % (os.getpid(), time.strftime("%Y-%m-%d %H:%M:%S"))
+    try:
+        f.seek(0)
+        f.truncate()
+        f.write(info)
+        f.flush()
+    except OSError:
+        pass
+    try:
+        with open(path + ".owner", "w", encoding="utf-8") as of:
+            of.write(info)
+    except OSError:
+        pass
+    _INSTANCE_LOCK_HANDLE = f
+    _INSTANCE_LOCK_PATH = path
+    return True, ""
+
+
+def release_instance_lock():
+    global _INSTANCE_LOCK_HANDLE
+    f, _INSTANCE_LOCK_HANDLE = _INSTANCE_LOCK_HANDLE, None
+    if f is None:
+        return
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            try:
+                msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+            except OSError:
+                pass
+    finally:
+        try:
+            f.close()
+        except OSError:
+            pass
+        try:
+            os.remove(_INSTANCE_LOCK_PATH + ".owner")
+        except OSError:
+            pass
 
 def _load_api_key():
     """优先环境变量，其次脚本同目录的 key.txt"""
@@ -128,8 +264,9 @@ BACKEND = os.environ.get("SKY_INPUT_BACKEND", "arduino")
 # 使用者识别（白名单）: 开启后只回复白名单内玩家的消息, 路人消息直接丢弃
 # SKY_WHITELIST_ENABLED=1 开启, =0 关闭（关闭后所有人都能触发, AI自己判断要不要回）
 # SKY_WHITELIST=逗号分隔的玩家昵称, 如 "珂珂,秋,小明"
-WHITELIST_ENABLED = os.environ.get("SKY_WHITELIST_ENABLED", "1") != "0"
-WHITELIST = [n.strip() for n in os.environ.get("SKY_WHITELIST", "珂珂").split(",") if n.strip()]
+# 白名单：环境变量优先，否则读 user_data/whitelist_settings.json（默认开启+珂珂）
+WHITELIST_ENABLED = whitelist_enabled_of()
+WHITELIST = whitelist_names_of()
 
 WATCH_INTERVAL   = 0.10
 # watch 真实节拍的打印间隔（秒）。真机反推只有 ~1 拍/秒，与设计值 10 拍/秒差一个量级，
@@ -203,27 +340,52 @@ SELF_NAMES = ("星河",)     # AI操控的小号名字（自己的消息标记�
 # SKY_YOLO_MODEL=模型路径
 # SKY_YOLO_CONF=置信度阈值
 YOLO_ENABLED = os.environ.get("SKY_YOLO_ENABLED", "1") != "0"
-# 默认模型：22 类 v6 版（0-11 同 v5：chat_input/hand_icon/open_tree_icon/accept_hug/
-# accept_carry/accept_high_five/accept_fist_bump/follow/wing_light/light/focus/seat；
-# 12-21 新增：bear_hug/curtain_call/fancy_high_five/handshake/head_pat/mutual_light/
-# play_fight/shoulder/spin_dance/whisper），同学笔记本 N 卡 batch4 imgsz960 训练，
-# 2026-10-21 验收（97 轮，best 第 72 轮），val：precision0.996/recall1.0/mAP50 0.995/
-# mAP50-95 0.914，每类 recall 均为 1.0。旧 12 类模型保留在
-# runs/detect/sky_v5_12cls/weights/best.pt，需要回退时设 SKY_YOLO_MODEL 指向它即可。
-YOLO_MODEL_PATH = os.environ.get("SKY_YOLO_MODEL",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                 "runs", "detect", "sky_v6_22cls", "weights", "best.pt"))
-YOLO_CONF_THRESHOLD = float(os.environ.get("SKY_YOLO_CONF", "0.8"))
+# 默认模型：28 类 v8 版（2026-11-09 云 3060 1280 训出，best epoch 62，val mAP50 0.995 /
+# mAP50-95 0.9496；权重在 models/yolo/sky_v8_28cls_best.pt，SHA256 见同目录 SHA256SUMS.txt）。
+# 推理尺寸默认 960（1280 训的模型在 960 下 val mAP50-95 0.9472，差距 <0.3 点，速度约快 1.5 倍；
+# SKY_YOLO_IMGSZ 可改，1280 更准但 CPU 上每帧约 170ms）。
+# 0-21 与 v6 完全一致（索引不乱），22-27 为新增类：instrument/settings_menu/butterfly_lure/
+# action_cancel/princess_hug/duo_dance——其中 5 类项目代码暂未消费，检出来也没人用，无害。
+# 文件缺失（比如在没同步模型包的机器上）时自动回退 v6 22 类；强制指定用 SKY_YOLO_MODEL。
+# 历史：v6 22 类 = 0-11 同 v5（chat_input/hand_icon/open_tree_icon/accept_hug/accept_carry/
+# accept_high_five/accept_fist_bump/follow/wing_light/light/focus/seat），12-21 = bear_hug/
+# curtain_call/fancy_high_five/handshake/head_pat/mutual_light/play_fight/shoulder/spin_dance/whisper。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_V8_MODEL = os.path.join(_HERE, "models", "yolo", "sky_v8_28cls_best.pt")
+_V7_MODEL = os.path.join(_HERE, "models", "yolo", "sky_v7_28cls_best.pt")
+_V6_MODEL = os.path.join(_HERE, "runs", "detect", "sky_v6_22cls", "weights", "best.pt")
+_DEFAULT_MODEL = (_V8_MODEL if os.path.exists(_V8_MODEL)
+                  else _V7_MODEL if os.path.exists(_V7_MODEL) else _V6_MODEL)
+YOLO_MODEL_PATH = os.environ.get("SKY_YOLO_MODEL", _DEFAULT_MODEL)
+YOLO_IMGSZ = int(os.environ.get("SKY_YOLO_IMGSZ", "960"))
+YOLO_CONF_THRESHOLD = float(os.environ.get("SKY_YOLO_CONF", "0.5"))
+# 2026-11-01 调整：全局过滤从 0.8 降到 0.5 —— 真机日志里 accept_hug 只有 0.81~0.85，
+# 贴着 0.8 的门槛；低于 0.8 的框在进各动作判断前就被模型参数丢了，
+# 导致 SKY_ACCEPT_CONF / SKY_INSTRUMENT_CONF 形同虚设、邀请"时有时无"。
+# 安全靠下面每个动作类各自的门限兜底（不是靠全局 0.8）：
+#   hand_icon / open_tree_icon / chat_input / wing_light / settings_menu 仍用 0.8~0.85，
+#   accept 类 0.7（真机 0.81~0.85，留余量），instrument 0.5。
 YOLO_DETECT_INTERVAL = 0.4  # YOLO检测间隔（秒），1秒约2.5次
+
+# 各动作类的独立门限（全局过滤降低后，必须逐类兜住误检）
+HAND_CONF = float(os.environ.get("SKY_HAND_CONF", "0.8"))            # 牵手图标（按 F 前用）
+OPEN_TREE_CONF = float(os.environ.get("SKY_OPEN_TREE_CONF", "0.8"))  # 好友树入口（按 F 开树前用）
+CHAT_CONF = float(os.environ.get("SKY_CHAT_CONF", "0.8"))            # 聊天输入框（面板判定）
 
 # ── 好友互动邀请（对方发起 抱抱/背背/击掌/碰拳，屏幕出现圆形“接受”图标）──
 # SKY_ACCEPT_AUTO=1 才真正自动按 F 接受；默认 0=只观测、打印 [互动邀请] 日志但不按 F。
 # 先用观测模式在真机确认：邀请检出准、图标上方名字识别对、传送/加入等危险界面不会误触发，
 # 再打开自动（见任务阶段2/3）。
 ACCEPT_AUTO = os.environ.get("SKY_ACCEPT_AUTO", "0") == "1"
-ACCEPT_CONF = float(os.environ.get("SKY_ACCEPT_CONF", "0.8"))  # 接受图标的判定阈值（实测最低0.86）
+ACCEPT_CONF = float(os.environ.get("SKY_ACCEPT_CONF", "0.7"))  # 接受图标阈值（真机实测 0.81~0.85，留余量）
 ACCEPT_CONFIRM_FRAMES = int(os.environ.get("SKY_ACCEPT_FRAMES", "2"))  # 连续几拍检测到才认定（防抖）
 ACCEPT_COOLDOWN = float(os.environ.get("SKY_ACCEPT_COOLDOWN", "12.0"))  # 同一动作事件触发后冷却秒数
+# ── 近期互动去重（防 OCR 延迟读到旧请求，导致同一动作刚做完又主动发起一次；日志 loop_20261025 重复抱抱）──
+# 只在 AI 上下文里保留最近 N 秒的"已发生互动"（接受/发起），让 AI 自己知道刚抱过/摸过。
+INTERACTION_MEMORY_SECONDS = float(os.environ.get("SKY_INTERACTION_MEMORY_SEC", "180.0"))
+# 确定性兜底：同一动作刚接受/发起完 N 秒内、且屏幕上无新邀请图标，AI 仍重复发起同动作时跳过（只说话）。
+# 设 0 关闭兜底，完全交给 AI 依据"刚刚发生过的互动"自行判断。
+INITIATE_DEDUP_SECONDS = float(os.environ.get("SKY_DEDUP_INITIATE_SEC", "45.0"))
 # 连续多少拍没检测到才认定图标真消失（消失宽限，防单帧漏检被当成新邀请）。约 0.4s/拍。
 ACCEPT_MISS_FRAMES = int(os.environ.get("SKY_ACCEPT_MISS_FRAMES", "3"))
 # 阶段3（B2）拟人执行参数：
@@ -249,7 +411,133 @@ ACCEPT_CLASSES = {
     19: ("shoulder", "搭肩"),
     20: ("spin_dance", "共舞"),
     21: ("whisper", "耳语"),
+    # v7 28 类新增（2026-11-01 接入）：这两类本身就是"圆形 F 邀请图标"，与抱抱同类，
+    # 所以纳入 ACCEPT_CLASSES，走同一套白名单把关 / 事件级去重 / 15s 兜底。
+    # 注意：22 instrument、23 settings_menu 另有用途（弹琴确认 / 误开设置菜单），
+    # 24 butterfly_lure、25 action_cancel 暂只识别不执行。
+    26: ("princess_hug", "公主抱"),
+    27: ("duo_dance", "双人舞"),
 }
+
+# 类别表校验结果（模型加载后计算）：ACCEPT_CLASSES 是按 class id 硬编码的，
+# 换模型时若类别顺序变了，会"检出 A 执行 B"且完全静默。校验不过就关掉互动接受。
+_accept_classmap_verified = False
+
+
+def classmap_mismatches(names_map, accept_classes=None):
+    """纯函数：比对模型类别表与 ACCEPT_CLASSES 的 id→名字映射，返回不一致项。
+
+    names_map: {class_id: class_name}（ultralytics 的 model.names）
+    返回 [(id, 期望名, 实际名), ...]；空列表表示**没有错位**。
+
+    判定口径（重要）：
+      - id 存在但名字不同 → 错位，必须报（这是"检出 A 执行 B"的根源）；
+      - id 根本不在模型里 → 不算错位，只表示这个模型没有该类（例如回退 v6 22 类时
+        26/27 不存在），此时该类本就检不出来，不该因此把全部互动接受关掉。
+    单独抽成纯函数是为了能离线单测——这段逻辑一旦错了就是"按错 F"。
+    """
+    table = ACCEPT_CLASSES if accept_classes is None else accept_classes
+    out = []
+    names_map = names_map or {}
+    for cid, (aname, _cn) in sorted(table.items()):
+        if cid not in names_map:
+            continue
+        if names_map[cid] != aname:
+            out.append((cid, aname, names_map[cid]))
+    return out
+
+
+# ── 设置菜单误开守卫（2026-11-01）─────────────────────────────────────
+# 场景：误触 ESC/动作键时游戏会弹出设置菜单，之后所有按键都打在菜单里，主链路等于瘫掉。
+# 对策：YOLO 检出 settings_menu(23) 就连按 ESC 关掉——首按 → 3s 未关补一次 → 15s 仍未关再补一次，
+#       一共最多 3 次；关掉就复位。只在聊天面板没开时动手（否则 ESC 会把聊天框关掉）。
+SETTINGS_GUARD_ENABLED = os.environ.get("SKY_SETTINGS_GUARD", "1") != "0"
+SETTINGS_CONF = float(os.environ.get("SKY_SETTINGS_CONF", "0.85"))
+SETTINGS_CONFIRM_FRAMES = int(os.environ.get("SKY_SETTINGS_FRAMES", "2"))
+SETTINGS_RETRY_SEC = float(os.environ.get("SKY_SETTINGS_RETRY", "3.0"))
+SETTINGS_RETRY2_SEC = float(os.environ.get("SKY_SETTINGS_RETRY2", "15.0"))
+SETTINGS_MAX_PRESS = 3
+SETTINGS_COOLDOWN_SEC = float(os.environ.get("SKY_SETTINGS_COOLDOWN", "60.0"))
+
+
+def settings_esc_plan(found, now, st, enabled=None, retry1=None, retry2=None,
+                      max_press=None, cooldown=None):
+    """纯决策：设置菜单误开时该怎么按 ESC。返回 (action, 新状态)。
+
+    action: "none" 不动作 / "press" 按一次 ESC / "give_up" 放弃并进入冷却
+    st: {"first_seen": float|None, "presses": int, "last_press": float, "gave_up_at": float}
+    规则（用户 2026-11-01 定）：首按 → 3s 还没关补按一次 → 15s 还没关再补一次，最多 3 次；
+    期间菜单消失立即复位；放弃后 60s 内不再折腾（防误检导致 ESC 连发）。
+    """
+    enabled = SETTINGS_GUARD_ENABLED if enabled is None else enabled
+    retry1 = SETTINGS_RETRY_SEC if retry1 is None else retry1
+    retry2 = SETTINGS_RETRY2_SEC if retry2 is None else retry2
+    max_press = SETTINGS_MAX_PRESS if max_press is None else max_press
+    cooldown = SETTINGS_COOLDOWN_SEC if cooldown is None else cooldown
+    new = dict(st or {})
+    new.setdefault("first_seen", None)
+    new.setdefault("presses", 0)
+    new.setdefault("last_press", 0.0)
+    new.setdefault("gave_up_at", 0.0)
+    if not enabled or not found:
+        # 菜单不在了（或守卫关闭）：一律复位，下次误开重新计
+        return "none", {"first_seen": None, "presses": 0,
+                        "last_press": 0.0, "gave_up_at": 0.0}
+    if new["gave_up_at"]:
+        if (now - new["gave_up_at"]) < cooldown:
+            return "none", new
+        # 冷却结束但菜单还开着：允许重新来一轮（否则会永远僵在那儿）
+        new.update(first_seen=now, presses=0, last_press=0.0, gave_up_at=0.0)
+    if new["presses"] == 0:
+        new.update(first_seen=now, presses=1, last_press=now, gave_up_at=0.0)
+        return "press", new
+    due = retry1 if new["presses"] == 1 else retry2
+    if now - new["last_press"] >= due:
+        if new["presses"] >= max_press:
+            new["gave_up_at"] = now
+            return "give_up", new
+        new["presses"] += 1
+        new["last_press"] = now
+        return "press", new
+    return "none", new
+
+
+# 设置菜单守卫的运行时状态（watch 线程每拍推进）
+_settings_frames = 0
+_settings_state = {"first_seen": None, "presses": 0, "last_press": 0.0, "gave_up_at": 0.0}
+
+
+def instrument_esc_plan(found, now, st, enabled=None, cooldown=None):
+    """纯决策：非弹琴时误开乐器界面，按 ESC 关闭。返回 (action, 新状态)。
+
+    action: "none" 不动作 / "press" 按一次 ESC
+    st: {"first_seen": float|None, "last_press": float, "presses": int}
+    乐器界面一次 ESC 即可关闭，所以这里只做"确认后按一次 + 冷却防连发"，
+    不像设置守卫那样多次补按。found 已在 watch 里做连续帧确认。
+    """
+    enabled = INSTRUMENT_GUARD_ENABLED if enabled is None else enabled
+    cooldown = INSTRUMENT_GUARD_COOLDOWN if cooldown is None else cooldown
+    new = dict(st or {})
+    new.setdefault("first_seen", None)
+    new.setdefault("last_press", 0.0)
+    new.setdefault("presses", 0)
+    if not enabled or not found:
+        # 界面不在了（或守卫关闭/不允许）：复位，下次误开重新计
+        return "none", {"first_seen": None, "last_press": 0.0, "presses": 0}
+    # 用 presses 判断是否按过（last_press 可能恰好是 0.0，不能用真值判断）
+    if new["presses"] and (now - new["last_press"]) < cooldown:
+        return "none", new
+    if new["first_seen"] is None:
+        new["first_seen"] = now
+    new["last_press"] = now
+    new["presses"] += 1
+    return "press", new
+
+
+# 乐器界面守卫的运行时状态（watch 线程每拍推进）
+_instrument_guard_frames = 0
+_instrument_guard_state = {"first_seen": None, "last_press": 0.0, "presses": 0}
+
 
 # ── 拟人互动·阶段2（Delta B1）：邀请事件喂给 LLM，星河先开口反应（台词），
 #    但【不按 F、不接受】，让互动有人味、不秒接；只发一句台词，零风险。
@@ -287,6 +575,35 @@ F_ALLOW_WITHOUT_GUARD = os.environ.get("SKY_F_ALLOW_WITHOUT_GUARD", "0") == "1"
 # 光翼类在模型里的名字（23 类模型若改名，用本变量对齐，不要把名字写死在多处）
 WING_LIGHT_CLASS_NAME = os.environ.get("SKY_WING_LIGHT_CLASS_NAME", "wing_light")
 
+# ── 光翼自动拾取（有翼号专用，默认关闭）────────────────────────────────
+# 检测到 wing_light（小金人拾取图标）、防抖确认后直接按 F 拾取，不走 AI、不说话
+# （星河当前不转视角/走动，只有靠近光翼才会触发，所以无需台词）。
+#
+# 双钥匙（2026-10-27，项目已开源，防别人拿无翼号误开）：
+#   钥匙① settings.json 的 account_winged  = 这个号是不是有翼号
+#   钥匙② settings.json 的 auto_pickup_wing / 环境变量 SKY_AUTO_PICKUP_WING
+#   **两把都到位才生效**；只设环境变量但没标记有翼号 → 强制关闭并告警。
+# 设置是本地文件（user_data/settings.json，已 gitignore），clone 下来默认全关。
+# 改设置：双击 setup_wing.bat（或 py setup_wing.py）。
+try:
+    from core.wing_settings import (
+        load_settings as _load_wing_settings,
+        resolve_pickup as _resolve_pickup,
+        describe as _describe_wing_settings,
+    )
+except Exception:  # 兜底：模块缺失时按最保守处理（关闭）
+    _load_wing_settings = lambda: {"account_winged": False, "auto_pickup_wing": False}
+    _resolve_pickup = lambda env, st: (False, "设置模块不可用，按最保守处理：关闭")
+    _describe_wing_settings = lambda st=None: "账号=无翼(默认) 自动拾取开关=关(默认)"
+
+_WING_SETTINGS = _load_wing_settings()
+AUTO_PICKUP_WING, _PICKUP_REASON = _resolve_pickup(
+    os.environ.get("SKY_AUTO_PICKUP_WING", ""), _WING_SETTINGS)
+# 拾取按 F 时长 / 首次未生效时补按间隔 / 最多按几次（含首次，参考抱抱首次 F 偶发未生效）
+WING_PICKUP_F_MS = int(os.environ.get("SKY_WING_PICKUP_F_MS", "80"))
+WING_PICKUP_RETRY_INTERVAL = float(os.environ.get("SKY_WING_PICKUP_RETRY_INTERVAL", "2.5"))
+WING_PICKUP_MAX_PRESSES = int(os.environ.get("SKY_WING_PICKUP_MAX_PRESSES", "3"))
+
 # YOLO 实时预览窗口：SKY_YOLO_PREVIEW=1 时弹出一个窗口，显示游戏画面叠加 YOLO 识别框
 # （7 类 + 类别名 + 置信度），用于直观看“YOLO 此刻识别到了什么”。默认关，不影响运行。
 # 窗口里按 q 或点右上角 × 只关闭预览，主程序继续跑。
@@ -305,10 +622,9 @@ NAME_OCR_SCALE = 4             # 放大倍数（小字体需要放大）
 # SKY_TEMPLATE_HAND_ENABLED=1 开启, =0 关闭（默认关闭）
 TEMPLATE_HAND_ENABLED = os.environ.get("SKY_TEMPLATE_HAND_ENABLED", "0") != "0"
 
-# 内存读取聊天（可选，比OCR准确，但需要管理员权限，有封号风险）
-# SKY_MEM_READER=1 启用, =0 关闭（默认关闭，使用OCR）
-# 启用后跳过OCR聊天识别，直接从游戏内存读取聊天消息
-MEM_READER_ENABLED = os.environ.get("SKY_MEM_READER", "0") == "1"
+# 内存读取聊天（SKY_MEM_READER）已于 2026-10-31 从运行时移除：
+# 相关代码与脚本移入 research_游戏内存读取_仅研究/（仅研究、禁止实际/违法使用）。
+# 运行时只保留 OCR 截图识别聊天的链路。
 
 # 自动接传送/确认弹窗（好友传送过来时自动按空格接受）
 # SKY_ACCEPT_TELEPORT=1 启用, =0 关闭（默认关闭：自动接弹窗会误触聊天面板，先手动接）
@@ -374,12 +690,22 @@ GOHOME_CHAT_COOLDOWN = 15.0  # 回遇境后多少秒内不打开聊天框
 # ===================== System Prompt（人设） =====================
 
 def _load_persona() -> str:
-    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "persona.txt")
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    except OSError:
-        return ""
+    # 优先 user_data/persona.txt（本地个性化，不进仓库/同步包）；
+    # 没有再读项目根 persona.txt（随项目分发的默认人设）
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = (
+        os.path.join(base, "user_data", "persona.txt"),
+        os.path.join(base, "persona.txt"),
+    )
+    for p in candidates:
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            if text:
+                return text
+        except OSError:
+            continue
+    return ""
 
 SYSTEM = _load_persona()
 
@@ -402,8 +728,9 @@ def _next_rpc_id(name: str) -> int:
 def _make_session() -> requests.Session:
     s = requests.Session()
     s.headers.update({"Content-Type": "application/json"})
-    if MCP_TOKEN:
-        s.headers["Authorization"] = "Bearer " + MCP_TOKEN
+    tok = _mcp_token()
+    if tok:
+        s.headers["Authorization"] = "Bearer " + tok
     return s
 
 
@@ -530,7 +857,9 @@ class SharedState:
         self.sent_history: list[tuple[str, float]] = []
         self.action_busy: bool = False
         self.last_confirm_time: float = 0
-        self.last_chat_ocr_time: float = 0
+        # 初值取当前时间而不是 0：否则首帧的"距上次 OCR"会算出 17 亿秒
+        # （真机日志实证：10/27 那次 [OCRDiag] 距上次=1793066262.8s），诊断数字失真
+        self.last_chat_ocr_time: float = time.time()
         self.last_reopen_time: float = 0
         self.last_action_end: float = 0
         self.last_fhand_time: float = 0
@@ -564,6 +893,98 @@ class SharedState:
         # ── 待处理互动邀请（图标持续在屏期间保留；AI 据此知道邀请是否还在等待）──
         # {aname: {"action_cn": 中文, "first_seen": 时间}}；watch 线程写、ai_loop 读，均过 state.lock
         self.pending_invites: dict = {}
+
+        # ── 近期已完成互动（让 AI 知道刚抱过/摸过，避免把 OCR 延迟读到的旧请求当新请求重复发起）──
+        # 每项 {"cn": 动作中文, "kind": "accepted"(接受玩家邀请)/"initiated"(AI主动发起), "ts": 时间}
+        self.recent_interactions: list = []
+
+        # ── 待确认的点歌版本选择（同名曲谱有多个版本时问玩家要哪个）──
+        # {"query": 玩家原本点的歌名, "candidates": [候选], "asked_at": 提问时间}
+        # action 线程写、ai_loop 读，均过 state.lock；None 表示当前没有待选
+        self.pending_song_choice: dict | None = None
+        self.pending_song_choice_at: float = 0
+
+# ===================== 近期互动记忆（防重复发起） =====================
+
+def record_interaction(state, cn, kind):
+    """记录一次已完成的双人互动。
+
+    kind: 'accepted'=阶段3 按 F 接受了玩家发起的邀请；'initiated'=AI 主动走好友树发起。
+    只保留最近 INTERACTION_MEMORY_SECONDS、最多 8 条，供 AI 上下文去重。
+    """
+    if not cn:
+        return
+    now = time.time()
+    with state.lock:
+        state.recent_interactions = [
+            e for e in state.recent_interactions if now - e.get("ts", 0) <= INTERACTION_MEMORY_SECONDS
+        ]
+        state.recent_interactions.append({"cn": cn, "kind": kind, "ts": now})
+        if len(state.recent_interactions) > 8:
+            state.recent_interactions = state.recent_interactions[-8:]
+
+
+def recent_interactions_snapshot(state, within=None):
+    """返回近期互动列表（拷贝、按时间升序），默认只返回记忆窗口内的。"""
+    now = time.time()
+    window = within if within is not None else INTERACTION_MEMORY_SECONDS
+    with state.lock:
+        return [dict(e) for e in state.recent_interactions if now - e.get("ts", 0) <= window]
+
+
+def _human_ago(seconds):
+    if seconds < 60:
+        return f"约{int(seconds)}秒前"
+    return f"约{int(seconds // 60)}分钟前"
+
+
+def build_recent_interaction_prompt(state, now=None):
+    """构造注入给 AI 的"刚刚发生过的互动"段落；窗口内无事件则返回空串。"""
+    now = now if now is not None else time.time()
+    events = [e for e in recent_interactions_snapshot(state) if now - e.get("ts", 0) <= INTERACTION_MEMORY_SECONDS]
+    if not events:
+        return ""
+    # 同一动作只保留最近一次（不管是接受还是发起）
+    latest = {}
+    for e in events:
+        cn = e.get("cn")
+        if cn not in latest or e.get("ts", 0) > latest[cn].get("ts", 0):
+            latest[cn] = e
+    kind_cn = {"accepted": "你接受了珂珂发起的", "initiated": "你主动发起的"}
+    lines = []
+    for cn, e in sorted(latest.items(), key=lambda kv: kv[1].get("ts", 0)):
+        who = kind_cn.get(e.get("kind"), "你和珂珂")
+        lines.append(f"· {who}「{cn}」（{_human_ago(now - e.get('ts', now))}）")
+    acts = "、".join(f"「{cn}」" for cn in latest.keys())
+    return (
+        "\n\n## 刚刚发生过的互动（避免重复，重要）\n最近你和珂珂已经有过这些互动：\n"
+        + "\n".join(lines)
+        + "\n聊天记录里若出现与刚才互动相关的话（如“抱一下嘛”“摸摸头”），很可能是那件事发生时珂珂发的、"
+        "画面 OCR 现在才读到的旧消息，**不是新请求**。上面已经做过的动作 " + acts + " 不要再重复输出同一个 [ACT]，"
+        "用说话自然回应即可。只有当屏幕上又出现新的互动邀请图标、或珂珂明确再说一次（如“再抱一次”“又抱抱”）、"
+        "或你自己确实想再做一次时，才重新做，并且要把开始标签写成带感叹号的 [ACT!]（例如 [ACT!]抱抱[/ACT]），"
+        "表示你清楚刚做过、是有意再做一次；普通 [ACT] 会被当成误读而只发台词、不执行动作。"
+    )
+
+
+def is_duplicate_initiate(state, act):
+    """判定 AI 主动发起的好友树动作是否为 OCR 延迟导致的重复。
+
+    同一动作在 INITIATE_DEDUP_SECONDS 内刚接受/发起过、且屏幕上没有该动作的新邀请图标 → True（跳过）。
+    屏幕上又有该动作邀请图标（玩家再次发起，交给阶段3）或窗口已过 → False。窗口=0 关闭兜底。
+    """
+    if INITIATE_DEDUP_SECONDS <= 0:
+        return False
+    now = time.time()
+    with state.lock:
+        pending = {v.get("action_cn") for v in state.pending_invites.values()}
+        dup = any(
+            e.get("cn") == act and now - e.get("ts", 0) <= INITIATE_DEDUP_SECONDS
+            for e in state.recent_interactions
+        )
+    if act in pending:
+        return False
+    return dup
 
 # ===================== 面板操作（读 WorldState） =====================
 
@@ -712,12 +1133,89 @@ def _wing_light_near(now=None):
     return bool(_yolo_wing_light_last_seen) and now - _yolo_wing_light_last_seen <= WING_LIGHT_HOLD
 
 
+# ── 光翼防护态同步到 MCP（2026-11-01）────────────────────────────────────
+# 光翼硬门原本只在 `_key()` 里生效，而 MCP 的 `press_key` 是对外暴露的底层按键接口，
+# 任何绕过 loop 的调用方（外部脚本/另一个会话/调试工具）都能直接按 F。这里把状态机的
+# 结论推给 MCP，让真正的输入边界自己拒绝 F，不再依赖调用方自律。
+_wing_guard_pushed = None      # 上次成功推送的状态（None=本次启动还没推过）
+_wing_guard_push_at = 0.0      # 上次成功推送时刻
+_wing_guard_fail_at = 0.0      # 上次推送失败时刻（失败后退避，避免每拍都打 HTTP）
+WING_GUARD_REFRESH_SEC = 10.0  # 防护态下每 10s 重申一次，防 MCP 重启后悄悄放行 F
+
+
+def _push_wing_guard(active=None, now=None):
+    """把“当前是否在光翼附近”同步给 MCP（副作用函数；失败不影响本地硬门）。
+
+    - 状态变化 → 立即推；
+    - 防护态 → 每 WING_GUARD_REFRESH_SEC 重申一次（MCP 重启/重连后不会丢状态）；
+    - 解除态 → 只在状态变化时推一次，不刷屏；
+    - 推送失败 → 30s 内不再重试（MCP 是旧版、没有该工具时不会每拍阻塞 30s）。
+    """
+    global _wing_guard_pushed, _wing_guard_push_at, _wing_guard_fail_at
+    if active is None:
+        active = _wing_light_near()
+    active = bool(active)
+    now = time.time() if now is None else now
+    if now - _wing_guard_fail_at < 30.0:
+        return
+    if _wing_guard_pushed is not None and active == _wing_guard_pushed:
+        if not active or (now - _wing_guard_push_at) < WING_GUARD_REFRESH_SEC:
+            return
+    try:
+        mcp("set_wing_guard", {"active": active})
+    except Exception as e:
+        _wing_guard_fail_at = now
+        if DEBUG:
+            print(f"  [Guard] 同步 MCP 防护态失败（本地硬门仍生效）: {e}")
+        return
+    _wing_guard_pushed = active
+    _wing_guard_push_at = now
+
+
 def _key(sess, k, ms=80):
     if str(k).lower() == "f" and _wing_light_near():
         print("  [Guard] 附近有光翼，拦截 F（无翼保护，不拾取光翼）")
         return
     mcp("press_key", {"key": k, "duration_ms": ms, "backend": BACKEND},
         session=sess)
+
+
+# 光翼自动拾取状态（仅 AUTO_PICKUP_WING 开启时由 watch_loop 推进）：
+# 本次光翼已按 F 次数（0=本次还没按；图标持续期间补按）、上次按 F 时刻。
+_wing_pickup_presses = 0
+_wing_pickup_last_press = 0.0
+
+
+def wing_pickup_step(sess, now, seen):
+    """光翼自动拾取（有翼号、SKY_AUTO_PICKUP_WING=1），由 watch_loop 在 YOLO 检测后调用。
+    入参：防抖确认后的光翼状态 seen（True=附近有光翼）。
+      - seen 且本次还没按：立即按 F 拾取；
+      - 按 F 后图标仍在（首次 F 偶发未生效）：每 WING_PICKUP_RETRY_INTERVAL 秒补按一次，
+        最多 WING_PICKUP_MAX_PRESSES 次；
+      - seen 变 False（图标消失）：拾取完成，重置，等下一个光翼。
+    直接走底层 mcp 按 F（绕过 _key 硬门拦截，因为这是有意拾取，不是误触）。
+    由于 MCP 层现在也有 F 闸，这里两处调用都带 wing_pickup=True 显式放行；
+    该标记只在本函数出现，前提是「账号有翼 + 自动拾取开启」两把钥匙都到位。"""
+    global _wing_pickup_presses, _wing_pickup_last_press
+    if not seen:
+        if _wing_pickup_presses:
+            print("  [Pickup] 光翼图标消失，拾取完成")
+        _wing_pickup_presses = 0
+        _wing_pickup_last_press = 0.0
+        return
+    if _wing_pickup_presses == 0:
+        _wing_pickup_presses = 1
+        _wing_pickup_last_press = now
+        print("  [Pickup] 检出光翼，按 F 拾取（有翼号自动拾取）")
+        mcp("press_key", {"key": "f", "duration_ms": WING_PICKUP_F_MS,
+                          "backend": BACKEND, "wing_pickup": True}, session=sess)
+    elif (_wing_pickup_presses < WING_PICKUP_MAX_PRESSES
+          and now - _wing_pickup_last_press >= WING_PICKUP_RETRY_INTERVAL):
+        _wing_pickup_presses += 1
+        _wing_pickup_last_press = now
+        print(f"  [Pickup] 光翼仍在，补按 F（第 {_wing_pickup_presses} 次）")
+        mcp("press_key", {"key": "f", "duration_ms": WING_PICKUP_F_MS,
+                          "backend": BACKEND, "wing_pickup": True}, session=sess)
 
 
 def open_panel_plan(obs, need=2, cooldown=6, max_press=2):
@@ -828,7 +1326,7 @@ def _reopen_panel_after_action(det, sess, state):
 
 
 def _close_panel(det, sess) -> bool:
-    # 多次检测确认面板状态，避免误判导致反复按C
+    # 多次检测确认面板状态，避免误判导致反复按 ESC
     def _check_closed():
         for _ in range(5):
             if panel_open(det) is not True:
@@ -837,14 +1335,14 @@ def _close_panel(det, sess) -> bool:
         return False
     if _check_closed():
         return True
-    # 只按C关闭面板（不按Enter，Enter会激活未激活的输入框导致C被输入成字母）
-    _key(sess, "c", 150)
+    # 2026-11-09 真机：聊天输入框激活时按 C 只会打字、不会关面板；
+    # 提示行写的是 "ESC 退后"，所以用 ESC 关（首下退输入态，第二下关面板）。
+    _key(sess, "escape", 150)
     if wait_panel(det, False, 2.0):
         return True
-    # 按C后如果面板还开着，再按一次
     if panel_open(det):
-        time.sleep(0.5)
-        _key(sess, "c", 150)
+        time.sleep(0.3)
+        _key(sess, "escape", 150)
         if wait_panel(det, False, 2.0):
             return True
     return _check_closed()
@@ -856,7 +1354,7 @@ def _verify_pose_with_vision(det, sess, target_pose, max_round=2, settle=1.2):
     才采信这个姿势——单次误判/认错人/动画中间帧都不会触发补按。
       · 两次一致且到目标 -> 成功；
       · 两次不一致或有 sure=false -> 看不清，回退盲信目标，绝不乱补；
-      · 两次一致但都没到目标 -> 补按1次3，再看；补按后距离没变小就停，防绕圈站起。"""
+      · 两次一致但都没到目标 -> 补按1次姿势键，再看；补按后距离没变小就停，防绕圈站起。"""
     def _observe(wait):
         if wait:
             time.sleep(wait)  # 等姿势动画落定，避免看到中间帧
@@ -880,8 +1378,9 @@ def _verify_pose_with_vision(det, sess, target_pose, max_round=2, settle=1.2):
         dist = pose_press_delta(POSE_STATES[observed], POSE_STATES[target_pose])
         if dist == 0:
             break
-        print(f"  [Vision] 两次确认{observed}未到{target_pose}（差{dist}），补按1次3")
-        _key(sess, "3", 80)
+        pose_k = keybind_pose_key()
+        print(f"  [Vision] 两次确认{observed}未到{target_pose}（差{dist}），补按1次{pose_k}")
+        _key(sess, pose_k, 80)
         time.sleep(0.55)
         n1 = _observe(settle)
         n2 = _observe(0.4)
@@ -1170,7 +1669,18 @@ REOPEN_PANEL_AFTER_ACTION = os.environ.get("SKY_REOPEN_AFTER_ACTION", "1") != "0
 
 
 def _send_msg(det, sess, msg, state) -> bool:
-    global _last_gohome_time, _sending_msg
+    global _last_gohome_time, _sending_msg, _song_deferred_dropped
+    # 弹奏中不发消息：发消息要按 C 开聊天面板，面板一开，演奏按键会被当成打字
+    # 打进输入框（甚至被回车发出去）。C 本身**不关**乐器界面（关只有 ESC），
+    # 但"音符变成聊天文字"同样会毁掉这一曲，所以先攒着、会话结束后补发。
+    if _song_session_active:
+        while len(_song_deferred_chat) >= max(1, SONG_DEFERRED_MAX):
+            _song_deferred_chat.pop(0)
+            _song_deferred_dropped += 1
+        _song_deferred_chat.append(msg)
+        print(f"  [弹琴] 弹奏中先不发消息，攒着（弹完再发，队列 {len(_song_deferred_chat)}/"
+              f"{SONG_DEFERRED_MAX}）: {msg}")
+        return True
     # 回遇境后15秒内不打开聊天框（避免干扰回遇境过程）
     if time.time() - _last_gohome_time < GOHOME_CHAT_COOLDOWN:
         remaining = GOHOME_CHAT_COOLDOWN - (time.time() - _last_gohome_time)
@@ -1318,7 +1828,7 @@ def _go_home_action(det, state, sess):
     if not _close_panel(det, sess):
         print("  [Action] 面板可能还开着，不影响回家，继续")
     print("  [Action] 回家...")
-    _key(sess, "8", 80);       time.sleep(0.5)
+    _key(sess, ACT_KEYS.get("回遇境", "5"), 80);       time.sleep(0.5)
     _key(sess, "space", 100);  time.sleep(1.0)
 
     if _wait_arrive(det, 20.0, target=Screen.HOME):
@@ -1460,6 +1970,7 @@ def _friend_tree_action(det, sess, state, act):
         _key(sess, "escape", 120)
         time.sleep(0.5)
         print(f"  [Action] {act} 已发起，好友树已收起")
+        record_interaction(state, act, "initiated")
         return True
     finally:
         _friend_tree_busy = False
@@ -1472,12 +1983,9 @@ def _friend_tree_action(det, sess, state, act):
                 state.pose_update_time = time.time()
 
 
-ACT_KEYS = {
-    '点火': '1', 
-    '收火': '1', 
-    '鞠躬': '2',
-    '回遇境': '5',
-}
+# 动作键位从 keybind_settings 读取（默认 点火/收火=1、鞠躬=2、回遇境=5，
+# 可跑向导或改 user_data/keybind_settings.json；环境变量 SKY_*_SLOT 可临时覆盖）
+ACT_KEYS = keybind_act_keys()
 
 # 姿势动作映射：动作名 -> 目标状态
 # 光遇坐下表情循环：站(0) -> 蹲(1) -> 坐(2) -> 躺(3) -> 站(0)
@@ -1503,9 +2011,10 @@ def _do_pose_action(det, sess, state, target_pose, current_pose=None, label=""):
         return target_pose
     if not _close_panel(det, sess):
         print(f"  [Action] 面板可能还开着，{label or target_pose} 是游戏键，照做")
-    print(f"  [Action] {label or target_pose} -> 当前{current_pose}，目标{target_pose}，按{press_count}次3")
+    pose_k = keybind_pose_key()
+    print(f"  [Action] {label or target_pose} -> 当前{current_pose}，目标{target_pose}，按{press_count}次{pose_k}")
     for i in range(press_count):
-        _key(sess, "3", 80)
+        _key(sess, pose_k, 80)
         time.sleep(0.7)
     final_pose = target_pose
     if VISION_POSE_CHECK and _vision.available:
@@ -1653,12 +2162,14 @@ def ensure_chat_wrapped(reply):
 
 
 # ACT 标签的统一定义：发送层/动作分发/回遇境判定都从这里取，避免各写各的正则。
-# 标签内允许空白（模型常输出 '[ACT] 回遇境 [/ACT]'），所以一律 group(1).strip() 后再比动作名。
-_ACT_TAG_RE = re.compile(r'\[ACT\](.*?)\[/ACT\]', re.DOTALL)
+# 标签内允许空白（模型常输出 '[ACT] 回遇境 [/ACT]'），所以一律 group(2).strip() 后再比动作名。
+# 开始标签可带感叹号：[ACT!] = "我知道刚做过，但确实要再做一次"（玩家明确要求或 AI 自己想），
+# 用于绕过"近期互动重复发起"兜底；普通 [ACT] 才走判重。group(1) 即 '!' 或 ''。
+_ACT_TAG_RE = re.compile(r'\[ACT(!?)\](.*?)\[/ACT\]', re.DOTALL)
 
 
 def extract_act_names(reply):
-    """提取回复里所有 [ACT]..[/ACT] 的动作名（已 strip 掉标签内空白）。
+    """提取回复里所有 [ACT]/[ACT!]..[/ACT] 的动作名（已 strip 掉标签内空白）。
 
     没有 ACT 标签/回复为空时返回 []。历史上回遇境的判定用的是精确串
     `'[ACT]回遇境[/ACT]' in reply`，模型一旦多打空格就漏判、导致"先发消息再回遇境"
@@ -1666,7 +2177,846 @@ def extract_act_names(reply):
     """
     if not reply:
         return []
-    return [m.group(1).strip() for m in _ACT_TAG_RE.finditer(reply)]
+    return [m.group(2).strip() for m in _ACT_TAG_RE.finditer(reply)]
+
+
+def extract_force_acts(reply):
+    """返回 [ACT!] 强制标记的动作名集合（AI 明确知道刚做过、仍要再做一次）。
+
+    这些动作在 _execute_reply 里绕过"近期互动重复发起"兜底；普通 [ACT] 不在集合内、照常判重。
+    """
+    if not reply:
+        return set()
+    return {m.group(2).strip() for m in _ACT_TAG_RE.finditer(reply) if m.group(1) == '!'}
+
+
+# ===================== 点歌（弹琴）：[ACT]弹琴:歌名[/ACT] =====================
+SONG_CHOICE_TTL = 120.0   # 待选版本的等待时限（秒），超时作废，避免玩家被一直追问
+# 只有这些话才主动作废待选；其它"不像序号"的回答一律保留（OCR 噪声太多，见下）
+SONG_GIVEUP_WORDS = ("不弹", "别弹", "算了", "不用了", "取消", "下次吧", "不想听")
+
+# ── 弹琴链路（2026-11-01）─────────────────────────────────────────────
+# 流程：AI 判定弹琴 → 曲库检索（多版本先问）→ 按玩家填的快捷栏键开乐器界面
+#      → YOLO 确认真的在乐器界面 → 才开始弹 → 期间扫停止词，命中就停曲 + ESC 退出。
+# 槽位**不做自动试按键**（1~8 里可能有坐下/躺下等副作用）：由玩家在 setup_song.bat
+# 里自己填，未填就不弹，只提示——这样不会替别人瞎按。
+SONG_HUMANIZE = int(os.environ.get("SKY_SONG_HUMANIZE", "0") or 0)   # 0 关（默认）/1 轻/2 明显
+INSTRUMENT_WAIT_SEC = float(os.environ.get("SKY_INSTRUMENT_WAIT", "6.0"))   # 等乐器界面出现
+INSTRUMENT_CONF = float(os.environ.get("SKY_INSTRUMENT_CONF", "0.5"))      # 乐器类置信度门限
+# 乐器界面确认专用：用更高分辨率 + 软阈值，避免"界面开了但小图标在 960 下掉到 0.5 以下"
+INSTRUMENT_CHECK_IMGSZ = int(os.environ.get("SKY_INSTRUMENT_CHECK_IMGSZ", "1280"))
+INSTRUMENT_SOFT_CONF = float(os.environ.get("SKY_INSTRUMENT_SOFT_CONF", "0.30"))
+SONG_STOP_WORDS = (os.environ.get("SKY_SONG_STOP_WORDS", "停止弹奏,结束弹奏,退出弹奏") or "").strip()
+SONG_STOP_SCAN_SEC = float(os.environ.get("SKY_SONG_STOP_SCAN", "2.0"))     # 停止信号扫描周期
+# 弹奏中「乐器界面消失」看门狗（2026-11-13 真机事故后加）：
+# 事故现象——乐器界面被意外关掉（焦点丢失 / 别的守卫按了 ESC / 切换窗口），但
+# SongPlayer 还在往游戏世界发音符；而 SongStopMonitor 只查 song_status、不看画面，
+# 于是表现为"界面没了但一直在弹"，玩家喊停也没人听（那一轮还叠加了线程崩溃）。
+# 做法：YOLO 连续 SONG_UI_LOST_SEC 秒看不到 instrument 类 -> 判定界面没了，停曲收尾。
+# 为什么敢用 YOLO 当判据：instrument 类真机 mAP50-95 = 0.914（v7，v8 更高），
+# 而且"开始弹奏"本身就是靠它确认界面的，同一判据前后一致。
+# 默认 10 秒：能容忍过场动画/短暂遮挡，又不会在界面真没了的时候干等。
+SONG_UI_LOST_SEC = float(os.environ.get("SKY_SONG_UI_LOST_SEC", "10"))
+# 播放卡死检测（2026-11-13 加）：song_status 里有 played_ms，正常播放时它一直在涨。
+# 若 status 仍是 playing 但 played_ms 超过 SONG_STALL_SEC 秒不前进，说明播放器卡住了
+# （焦点丢失/驱动吞键/MCP 队列堵），这时界面还在、看门狗也不会触发 -> 必须靠这个兜底。
+SONG_STALL_SEC = float(os.environ.get("SKY_SONG_STALL_SEC", "8"))
+# 弹奏中"先攒着、弹完再发"的 CHAT（2026-11-13 真机后加）：
+# **关乐器界面只有 ESC，C 不关**（用户真机确认）。但发消息要按 C 把聊天面板打开，
+# 面板一开，演奏按键（y/u/i/h/j/…）就会被当成打字打进输入框，甚至被回车发出去一团乱码。
+# 所以弹奏期间的 CHAT 一律攒下来，等会话结束由 action 线程统一补发。
+# 上限 SONG_DEFERRED_MAX 条，超了就丢最旧的（避免玩家连说十句攒一屏）。
+SONG_DEFERRED_MAX = int(os.environ.get("SKY_SONG_DEFERRED_MAX", "3"))
+_song_deferred_chat: list[str] = []
+_song_deferred_dropped = 0
+# song_status 连续查询失败多少次才放弃监控（一次 MCP 抖动不应让停止监控永久失效）
+SONG_STATUS_MAX_FAIL = int(os.environ.get("SKY_SONG_STATUS_MAX_FAIL", "5"))
+# 连续几拍都看到停止信号才动手。默认 1（命中即停）：停止意图词本身足够具体，
+# 靠词匹配 + 单拍 OCR 防抖即可；旧默认 2 拍在真机上会因气泡短暂、第二拍消失而漏停。
+# 若环境 OCR 误报多，可设 SKY_SONG_STOP_CONFIRM=2 回到更保守的两拍确认。
+SONG_STOP_CONFIRM = int(os.environ.get("SKY_SONG_STOP_CONFIRM", "1"))
+# 聊天里"想停"的意图。弹琴时聊天面板打不开、只能看到气泡，
+# 所以这里的文字来自气泡 OCR，判断的是"TA 是不是不想听了"。
+SONG_STOP_INTENTS = ("别弹", "不要弹", "不弹了", "停一下", "停下来", "停下", "换一首",
+                     "不想听", "太吵", "吵死", "安静点")
+# 乐器界面上那排键位提示（y u i o p / h j k l ; / n m , . /）会被 OCR 当文字读进来，
+# 必须滤掉，否则既污染意图判断、又可能被当成聊天内容喂给 AI。
+_SONG_KEYHINT_RE = re.compile(r"^[a-z0-9\s;,'\./\[\]\-`~!@#$%^&*()_+=\|\\\"]+$")
+
+_yolo_instrument_detected = False   # 本拍 YOLO 是否看到乐器界面
+_instrument_class_online = False    # 当前模型有没有 instrument 类（没有就跳过确认）
+# 当前是否处于"弹琴会话"（从开始播放到 monitor 退出）。乐器守卫据此保证正常弹琴时绝不触发。
+_song_session_active = False
+# 弹奏会话"代际号"（2026-11-13 加）：连弹/切歌会起第二个 SongStopMonitor 线程，
+# 两个线程共用 _song_session_active 这一个布尔会出事——先退出的那个在 finally 里把标志
+# 复位，后一首还在弹，乐器守卫立刻把界面 ESC 掉（"界面突然退出"）；两首都弹完时还会
+# 各按一次 ESC，双 ESC 在光遇里会跳级打开设置菜单。用代际号让旧线程安静退场。
+_song_gen = 0
+_song_monitor_lock = threading.Lock()
+# 我们自己按快捷栏开乐器的时间戳（2026-11-13 加）：乐器守卫只该关"我们自己开的"界面，
+# 不该关玩家手动打开的（以前玩家想自己弹琴，界面 2 帧后就被守卫 ESC 掉）。
+_instrument_opened_by_us_at = 0.0
+
+# ── 乐器界面守卫：非弹琴时误开乐器界面，自动 ESC 关闭（与设置守卫对称）──
+INSTRUMENT_GUARD_ENABLED = os.environ.get("SKY_INSTRUMENT_GUARD", "1") != "0"
+INSTRUMENT_GUARD_FRAMES = int(os.environ.get("SKY_INSTRUMENT_GUARD_FRAMES", "2"))
+INSTRUMENT_GUARD_COOLDOWN = float(os.environ.get("SKY_INSTRUMENT_GUARD_COOLDOWN", "30.0"))
+# 「只关我们自己开的界面」窗口（2026-11-13 加，修 11-11 记下的 P1）：
+# 以前守卫只认"不在弹琴会话"，于是**玩家自己按快捷栏开乐器**也会被当"误开"、
+# 2 帧后 ESC 关掉——玩家没法自己弹琴。
+# 现在守卫多一个条件：必须在 INSTRUMENT_GUARD_OWN_WINDOW 秒内按过槽位键（=我们开的）。
+# 120 秒足够覆盖"按开 → 等界面 → 播放失败 → 收尾"的全过程；
+# 想恢复旧行为（连玩家的也关）设 SKY_INSTRUMENT_GUARD_OWN=0。
+INSTRUMENT_GUARD_OWN = os.environ.get("SKY_INSTRUMENT_GUARD_OWN", "1") != "0"
+INSTRUMENT_GUARD_OWN_WINDOW = float(os.environ.get("SKY_INSTRUMENT_GUARD_OWN_WINDOW", "120"))
+
+
+def _instrument_in_frame(frame, imgsz=None):
+    """直接以 SKY_INSTRUMENT_CONF（默认 0.5）查一帧里有没有 instrument 类。
+
+    为什么要单独查：watch 的 YOLO 用 YOLO_CONF_THRESHOLD（默认 0.8）过滤，
+    低于 0.8 的框在进入 flag 逻辑前就被丢了，INSTRUMENT_CONF=0.5 形同虚设。
+    2026-11-01 真机事故：乐器界面明明开了，但 watch 没认出来 → 判 no_ui →
+    发失败台词按 C 把界面关掉，玩家看到"打开又关上"。
+    """
+    if _yolo_model is None or frame is None:
+        return False
+    try:
+        r = _yolo_model(frame, conf=INSTRUMENT_CONF, imgsz=imgsz or YOLO_IMGSZ,
+                        verbose=False)[0]
+        for b in r.boxes:
+            if (r.names[int(b.cls[0])] == "instrument"
+                    and float(b.conf[0]) >= INSTRUMENT_CONF):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _instrument_max_conf(frame):
+    """低阈值查一帧里 instrument 的最高置信度（用于软确认/诊断）。"""
+    if _yolo_model is None or frame is None:
+        return 0.0
+    try:
+        r = _yolo_model(frame, conf=0.05, imgsz=INSTRUMENT_CHECK_IMGSZ,
+                        verbose=False)[0]
+        best = 0.0
+        for b in r.boxes:
+            if r.names[int(b.cls[0])] == "instrument":
+                best = max(best, float(b.conf[0]))
+        return best
+    except Exception:
+        return 0.0
+
+
+def _ensure_instrument_ui(sess, wait_sec=None, det=None):
+    """按玩家设置的快捷栏键打开乐器界面，并（尽量）用 YOLO 确认真的开了。
+
+    返回 (ok, reason)：
+      - slot_unknown：没填槽位 —— 不猜、不按，交给上层提示玩家去设置；
+      - unverified  ：模型没有 instrument 类（如回退 v6），按了键但无法验证，放行并告警；
+      - no_ui       ：按了键但 wait 秒内没看到乐器界面 —— 不弹，避免在错误界面乱按；
+      - confirmed   ：确认到位，可以弹。
+    """
+    if _instrument_class_online and _yolo_instrument_detected:
+        # 已经开着（比如刚问过版本、界面还留着）：不要再按一次槽位键，可能把界面切掉
+        return True, "confirmed"
+    slot = song_slot_key()
+    if not slot:
+        return False, "slot_unknown"
+    _key(sess, slot, 80)
+    # 记一笔"我们自己开的"：乐器守卫据此只关我们自己开的界面，不关玩家手动开的
+    global _instrument_opened_by_us_at
+    _instrument_opened_by_us_at = time.time()
+    if not _instrument_class_online:
+        return True, "unverified"
+    wait = INSTRUMENT_WAIT_SEC if wait_sec is None else wait_sec
+    deadline = time.time() + max(0.5, wait)
+    last_frame = None
+    best_conf = 0.0
+    time.sleep(0.5)   # 等界面动画出现
+    # 留一张"按键后 0.5s"的现场帧：排查乐器界面到底开没开、模型看没看到
+    try:
+        _f0 = det.latest_frame() if det is not None else None
+        if _f0 is not None:
+            _d0 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp")
+            os.makedirs(_d0, exist_ok=True)
+            cv2.imwrite(os.path.join(_d0, "instrument_open_%s.png"
+                                     % time.strftime("%Y%m%d_%H%M%S")), _f0)
+    except Exception:
+        pass
+    while time.time() < deadline:
+        if _yolo_instrument_detected:
+            return True, "confirmed"
+        # watch 的 0.8 门限可能把 0.5~0.8 的 instrument 框丢掉，这里用低阈值直查
+        if det is not None:
+            last_frame = det.latest_frame()
+            if _instrument_in_frame(last_frame, imgsz=INSTRUMENT_CHECK_IMGSZ):
+                return True, "confirmed"
+            mc = _instrument_max_conf(last_frame)
+            if mc > best_conf:
+                best_conf = mc
+            if mc >= INSTRUMENT_SOFT_CONF:
+                print(f"  [弹琴] 乐器界面软确认（conf={mc:.2f}，阈值 {INSTRUMENT_SOFT_CONF:.2f}）")
+                return True, "confirmed_soft"
+        time.sleep(0.15)
+    # 失败时留一张现场帧（界面开着但没认出来 / 或界面真没开）
+    if last_frame is not None:
+        try:
+            _d = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp")
+            os.makedirs(_d, exist_ok=True)
+            cv2.imwrite(os.path.join(_d, "instrument_fail_%s.png"
+                                     % time.strftime("%Y%m%d_%H%M%S")), last_frame)
+        except Exception:
+            pass
+    print(f"  [弹琴] 等待 {wait:.1f}s 未确认乐器界面（最高乐器置信度 {best_conf:.2f}）")
+    # 失败也要收拾现场：ESC 一下（关了残留界面/聊天框；万一开成设置菜单由守卫兜底）
+    if sess is not None:
+        try:
+            _key(sess, "escape", 120)
+        except Exception:
+            pass
+    return False, "no_ui"
+
+
+def _song_tell_ai(msg, state, ai_q, force=False):
+    """把一条已经成形的消息（如 "[珂珂] 别弹了"）去重后塞给 AI。
+
+    force=True 时跳过去重：系统提示（"你弹完了"）即使同一首重复弹也要每次都送到，
+    否则玩家连弹两次同一首，第二次 AI 就永远不知道。
+
+    ai_q 传 None 时退回 state.ai_q（main 启动时挂在共享状态上）——因为
+    _do_play_song ← _execute_reply ← action_loop 这条链上拿不到 ai_q，
+    但"点歌失败"必须让 AI 知道（2026-11-12：not_found 连发 7 次，AI 还在说"弹啦"）。
+    """
+    if ai_q is None and state is not None:
+        ai_q = getattr(state, "ai_q", None)
+    if state is None or ai_q is None or not msg:
+        return
+    now = time.time()
+    try:
+        with state.lock:
+            if not force and _seen_before(state, msg, now):
+                return
+            state.recent_seen.append((msg, now))
+    except Exception:
+        return
+    try:
+        ai_q.put_nowait(([msg], True))
+    except queue.Full:
+        try:
+            ai_q.get_nowait()
+            ai_q.put_nowait(([msg], True))
+        except Exception:
+            pass
+
+
+def _song_ocr_lines(items):
+    """整屏 OCR → 只留"像人说的话"的行（纯函数，可离线单测）。
+
+    必须滤掉的两类噪声（2026-11-01 用户真机反馈）：
+      1. 乐器界面上那排键位提示 y u i o p / h j k l ; / n m , . / —— 全是 ASCII，
+         OCR 会把它们当成文字；
+      2. 纯英文/数字/符号的 UI 片段（音量、按钮标签）。
+    判据：至少 2 个字符、含汉字、且不是纯 ASCII 键位串。
+    """
+    out = []
+    for it in (items or []):
+        t = str((it or {}).get("text", "") or "").strip()
+        if len(t) < 2:
+            continue
+        if _SONG_KEYHINT_RE.match(t.lower()):
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", t):
+            continue
+        out.append(t)
+    return out
+
+
+def _song_normalize(t):
+    """OCR 文本规范化：去掉空白与标点，只留汉字/字母/数字，用于子串匹配。
+
+    解决真机两类漏识别：OCR 在词中插入空格（"停 一下"）、把标点误识成字。
+    只用于匹配，不替代原文——原文仍要原样显示、喂给 AI。
+    """
+    return re.sub(r"[^一-鿿a-z0-9]", "", str(t or "").lower())
+
+
+def _song_stop_hit(lines):
+    """判断这批行里有没有"想停"的意思。返回 (kind, word) 或 None。
+
+    kind="ui"   → 乐器界面上的"停止弹奏"之类（明确要关界面）
+    kind="chat" → 气泡里的话（"别弹了/换一首"），要交给 AI 接
+    匹配在【规范化文本】上做（去空格/标点），避免 OCR 插空格、标点误识导致漏匹配。
+    """
+    words = [w.strip() for w in SONG_STOP_WORDS.split(",") if w.strip()]
+    norm = [_song_normalize(t) for t in lines]
+    for i, nt in enumerate(norm):
+        for w in words:
+            nw = _song_normalize(w)
+            if nw and nw in nt:
+                return "ui", w
+    for i, nt in enumerate(norm):
+        for w in SONG_STOP_INTENTS:
+            if _song_normalize(w) in nt:
+                return "chat", w
+    return None
+
+
+def song_ui_lost(now, last_seen, lost_sec=None, class_online=None):
+    """纯决策：弹奏中「乐器界面已经连续多久看不到了」-> 该不该停。
+
+    返回 True 表示界面大概率真的没了（YOLO 连续 lost_sec 秒没有 instrument 类）。
+    - last_seen 为空/0：还没建立基线（刚开始弹），不判定；
+    - class_online=False：当前模型没有 instrument 类，无法判断 -> 不判定（宁可不误停）；
+    - 用 >= 而不是 >：正好到阈值就停，边界可预期（便于离线测试）。
+    """
+    if lost_sec is None:
+        lost_sec = SONG_UI_LOST_SEC
+    if class_online is None:
+        class_online = _instrument_class_online
+    if not class_online or not last_seen:
+        return False
+    return (now - last_seen) >= max(1.0, float(lost_sec))
+
+
+def song_stalled(now, played_ms, last_played, last_progress_at, stall_sec=None):
+    """纯决策：status=playing 但 played_ms 长时间不前进 -> 播放器卡死。
+
+    和 song_ui_lost 互补：
+      * 界面没了 -> song_ui_lost 负责（YOLO 看不到 instrument 类）
+      * 界面还在、但音符发不出去（焦点丢失/驱动吞键/MCP 堵）-> 它负责
+    有进展时返回 False，由调用方刷新基线（本函数不改状态，便于离线测试）。
+    """
+    if stall_sec is None:
+        stall_sec = SONG_STALL_SEC
+    if last_progress_at is None:
+        return False
+    if int(played_ms or 0) != int(last_played if last_played is not None else -1):
+        return False
+    return (now - last_progress_at) >= max(2.0, float(stall_sec))
+
+
+def instrument_guard_allowed(session_active, sending, chat_open, opened_by_us_at,
+                             now, own_enabled=None, own_window=None):
+    """纯决策：乐器界面守卫此刻**是否允许**按 ESC 关掉乐器界面。
+
+    四道门（任一不满足就不许关）：
+      1) 不在弹琴会话（正常弹琴绝不触发）；
+      2) 不在发消息（发消息期间按键会被面板吃掉）；
+      3) 聊天面板没开；
+      4) **必须是我们自己开的**（INSTRUMENT_GUARD_OWN_WINDOW 秒内按过槽位键）。
+    第 4 道是 2026-11-13 加的：11-11 记下的 P1——玩家手动打开乐器时
+    `session_active` 为 False，守卫会在 2 帧后把玩家的乐器界面 ESC 掉。
+    """
+    if session_active or sending or chat_open:
+        return False
+    if own_enabled is None:
+        own_enabled = INSTRUMENT_GUARD_OWN
+    if not own_enabled:
+        return True                      # 旧行为（连玩家手动开的也关）
+    if own_window is None:
+        own_window = INSTRUMENT_GUARD_OWN_WINDOW
+    try:
+        opened = float(opened_by_us_at or 0.0)
+    except (TypeError, ValueError):
+        opened = 0.0
+    if opened <= 0:
+        # 我们从没按过槽位键 -> 界面是玩家自己开的，一律不许关
+        # （注意不能直接拿 0 去算时间差：0 会被当成 1970 年，now-0 永远大于窗口）
+        return False
+    return (now - opened) <= max(1.0, float(own_window))
+
+
+def _song_close_instrument(sess):
+    """弹完/出错后收起乐器界面（best-effort：**绝不抛异常**）。
+
+    2026-11-09 真机：YOLO 可能认不出乐器界面（小图标/动画中），此前的
+    "没看到就不按"导致界面一直挂着、聊天面板打不开。改为**总是按一次 ESC**
+    （ESC 二义性由设置菜单守卫兜底：万一开成设置菜单，守卫会再按 ESC 关掉）。
+
+    2026-11-13 真机：游戏窗口不是前台时 MCP 会拒绝按键并抛 RuntimeError，
+    而本函数是在 SongStopMonitor 线程里被调用的 —— 一次焦点丢失就把整个
+    停止监控线程打死（日志里 `!!! 线程 SongStopMonitor 未捕获异常 !!!`），
+    之后"叫停不停"。所以这里改成 best-effort，失败只记一笔、返回 False。
+    """
+    try:
+        _key(sess, "escape", 120)
+        return True
+    except Exception as e:
+        print(f"  [弹琴] 收乐器界面失败（不影响继续）：{e}")
+        return False
+
+
+def _song_stop_and_close(sess):
+    """停曲 + 收乐器界面，两步都是 best-effort（**绝不抛异常**）。
+
+    抽出来是因为它在 SongStopMonitor 线程里被调用：任何一次 MCP 拒绝（焦点丢失等）
+    都不允许把停止监控线程打死——2026-11-13 真机就是这么炸的，之后"叫停不停"。
+    """
+    try:
+        mcp("stop_song", session=sess)
+    except Exception as e:
+        print(f"  [弹琴] 停曲请求失败（继续收界面）：{e}")
+    return _song_close_instrument(sess)
+
+
+def _song_finish_notice(state, ai_q, song_name):
+    """弹完后告诉 AI，并记一条日记（下次能"记得"弹过这首）。"""
+    name = str(song_name or "").strip() or "这首"
+    if state is not None and ai_q is not None:
+        _song_tell_ai(
+            f"[系统] 你刚给TA弹完《{name}》。可以顺势问一句TA觉得怎么样，"
+            f"但同一首别反复问；TA要是没接话就算了。", state, ai_q, force=True)
+    if name != "这首":
+        try:
+            add_diary_entry(f"给珂珂弹了《{name}》|弹琴|{name}")
+        except Exception as e:
+            print(f"  [弹琴] 记日记失败（不影响播放）：{e}")
+
+
+def _start_song_monitor(det, sess, state, ai_q, song_name):
+    """启动一次弹奏看护线程（带代际号，连弹/切歌时旧线程自动退场）。
+
+    所有起弹的地方都必须走这里，不要再直接 Thread(...).start()——
+    否则会同时跑两个 SongStopMonitor：先退出的那个会把 _song_session_active 复位，
+    导致乐器守卫在后一首还在弹时把界面 ESC 掉；两首弹完还会各按一次 ESC，
+    双 ESC 在光遇里会跳级打开设置菜单。
+    返回本次会话的代际号（便于测试）。
+    """
+    global _song_gen
+    with _song_monitor_lock:
+        _song_gen += 1
+        gen = _song_gen
+    threading.Thread(target=_song_stop_monitor,
+                     args=(det, sess, state, ai_q, song_name, gen),
+                     name="SongStopMonitor", daemon=True).start()
+    return gen
+
+
+def _song_stop_monitor(det, sess, state=None, ai_q=None, song_name="", gen=None):
+    """弹奏期间的后台看护：停止信号 + 弹完收尾。
+
+    A. 停止信号（停曲）：每 2s 全屏 OCR（滤掉键位提示噪声），连续 SONG_STOP_CONFIRM
+       拍命中才动手 → 停曲 + ESC 收起界面 → 把那句原话交给 AI 接一句。
+       为什么"先停后说"：弹琴时聊天面板打不开，AI 的 CHAT 根本发不出去，等它先决定
+       只会让不想听的音乐多响几秒。
+    B. 自然弹完（收尾）：`SongPlayer` 弹完只把状态改成 finished，**不会自己关界面**，
+       而界面挂着聊天面板就打不开。所以这里补两件事：收起乐器界面 + 告诉 AI 弹完了。
+    C. 已停止/出错：只收界面，不重复按 ESC（避免第二下 ESC 打开设置菜单）。
+    本函数生命周期 = 一次弹琴会话，用 try/finally 维护 _song_session_active，
+    供乐器守卫判断"正常弹琴中绝不触发"。
+    """
+    global _song_session_active, _song_gen
+    # 代际号：又起了一首 -> 本线程安静退场（不按 ESC、不发"弹完了"、不复位会话标志）
+    if gen is not None and gen != _song_gen:
+        print(f"  [弹琴] 会话 #{gen} 已被更新的 #{_song_gen} 取代，本线程直接退场")
+        return
+    _song_session_active = True
+    try:
+        need = max(1, SONG_STOP_CONFIRM)
+        scan_stop = bool(SONG_STOP_WORDS or SONG_STOP_INTENTS)
+        engine = _get_name_ocr_engine() if scan_stop else None
+        hits = 0
+        last_word = ""
+        last_line = ""
+        status_fail = 0
+        # 乐器界面看门狗的基线：刚开弹时界面是确认过的，从现在开始计"多久没再看到"
+        last_ui_seen = time.time()
+        # 播放卡死检测的基线：played_ms 上一次的值 + 它最后一次变化的时间
+        last_played = -1
+        last_progress_at = time.time()
+        while True:
+            try:
+                st = json.loads(mcp("song_status", session=sess) or "{}")
+                status_fail = 0
+            except Exception:
+                # 一次 MCP 抖动不退出：短暂重试，连续多次失败才放弃
+                status_fail += 1
+                if status_fail >= max(1, SONG_STATUS_MAX_FAIL):
+                    print(f"  [弹琴] 状态查询连续失败 {status_fail} 次，停止监控退出")
+                    return
+                time.sleep(0.5)
+                continue
+            status = str(st.get("status"))
+            if status == "idle":
+                return          # 从来没开始过（或播放器已复位）：静默退出，别误报"弹完了"
+            if status == "finished":
+                print(f"  [弹琴] 弹完了（{song_name or '这首'}）→ 收起乐器界面 + 告诉 AI")
+                _song_close_instrument(sess)
+                _song_finish_notice(state, ai_q, song_name)
+                return
+            if status in ("stopped", "error"):
+                # 停止路径已经按过 ESC（AI 的 [ACT]停止弹琴 也会按），这里只兜底界面残留
+                _song_close_instrument(sess)
+                if status == "error":
+                    print(f"  [弹琴] 播放出错：{st.get('last_error') or '未知'}")
+                return
+            # ── 播放卡死检测（界面还在、但音符发不出去）──
+            _played = int(st.get("played_ms") or 0)
+            if _played != last_played:
+                last_played = _played
+                last_progress_at = time.time()
+            elif song_stalled(time.time(), _played, last_played, last_progress_at):
+                print(f"  [弹琴] 播放卡住了（played_ms 已 {SONG_STALL_SEC:.0f}s 没前进）"
+                      f"→ 判定音符发不出去，停曲收尾")
+                _song_stop_and_close(sess)
+                _song_tell_ai(
+                    "[弹琴] 曲子卡住了（音符发不出去，可能是游戏不在前台或被吞键），"
+                    "已经停下。要重弹就重新点一次，或者先确认游戏窗口在前台。",
+                    state, ai_q, force=True)
+                return
+            frame = det.latest_frame() if scan_stop else None
+            if frame is not None:
+                try:
+                    lines = _song_ocr_lines(ocr_infer(engine, frame))
+                except Exception:
+                    lines = []
+                hit = _song_stop_hit(lines) if lines else None
+                if hit:
+                    hits += 1
+                    last_word = hit[1]
+                    # 规范化定位原文（OCR 可能在词中插空格，直接子串匹配会漏）
+                    _nw = _song_normalize(hit[1])
+                    last_line = next((t for t in lines
+                                      if _nw in _song_normalize(t)), "")
+                    if hits < need:
+                        print(f"  [弹琴] 疑似停止信号「{last_word}」"
+                              f"（{hits}/{need} 拍确认，抖一下就继续弹）")
+                else:
+                    if hits:
+                        print("  [弹琴] 停止信号消失了，判定为误读，继续弹")
+                    hits = 0
+                if hits >= need:
+                    print(f"  [弹琴] 确认停止（「{last_word}」）→ 停曲 + ESC 退出乐器界面")
+                    _song_stop_and_close(sess)
+                    # "弹到一半被叫停"是强偏好信号：记一条，下次 AI 能想起来
+                    if song_name:
+                        try:
+                            add_diary_entry(f"弹《{song_name}》时珂珂让停（中途停下）|弹琴|{song_name}")
+                        except Exception as e:
+                            print(f"  [弹琴] 记日记失败（不影响停止）：{e}")
+                    # 界面收起后聊天面板才打得开，这时候让 AI 接一句才发得出去
+                    if last_line:
+                        _song_tell_ai(f"[{AKI}] {last_line}", state, ai_q)
+                    return
+            # ── 乐器界面消失看门狗（2026-11-13 真机事故）──
+            # 界面被意外关掉但 SongPlayer 还在发音符时，这里的 song_status 仍是
+            # playing，光靠它发现不了。用 watch 线程每拍更新的 instrument 检测结果兜底。
+            if _yolo_instrument_detected:
+                last_ui_seen = time.time()
+            elif song_ui_lost(time.time(), last_ui_seen):
+                print(f"  [弹琴] 乐器界面已连续 {SONG_UI_LOST_SEC:.0f}s 没看到（YOLO）"
+                      f"→ 判定界面被关掉，停曲收尾")
+                _song_stop_and_close(sess)
+                if song_name:
+                    try:
+                        add_diary_entry(
+                            f"弹《{song_name}》时乐器界面意外关闭，弹奏中断|弹琴|{song_name}")
+                    except Exception as e:
+                        print(f"  [弹琴] 记日记失败（不影响停止）：{e}")
+                _song_tell_ai(
+                    "[弹琴] 乐器界面被关掉了（可能误触 ESC / 切窗口 / 过场），"
+                    "曲子已经中断。要接着弹就重新点一次，或者问玩家还想不想听。",
+                    state, ai_q, force=True)
+                return
+            time.sleep(max(0.5, SONG_STOP_SCAN_SEC))
+    finally:
+        # 只在"我仍是最新会话"时复位；被取代的旧线程不许碰这个标志，
+        # 否则会把还在弹的那一首暴露给乐器守卫（界面被 ESC）。
+        if gen is None or gen == _song_gen:
+            _song_session_active = False
+
+
+
+def _song_clear_pending(state):
+    """清空待选版本（写完 log 后调用，别在持锁时做耗时操作）。"""
+    with state.lock:
+        state.pending_song_choice = None
+        state.pending_song_choice_at = 0
+
+
+# ── AI 选版本协议（2026-11-01）：与其堆死板的"版本3/第三个"词表，不如
+#    把候选清单喂给 LLM，由它理解后输出 [PICK]序号[/PICK]。正则只当快速通道。
+_SONG_PICK_RE = re.compile(r"\[PICK\]\s*(\d{1,2})\s*\[/PICK\]", re.IGNORECASE)
+_SONG_ACT_RE = re.compile(r"\[ACT!?\]\s*弹琴[^\[]*?\[/ACT\]", re.IGNORECASE)
+
+
+def _song_pick_from_reply(reply):
+    """从 AI 回复里取 [PICK]N[/PICK] 的 N；没有/非法返回 None。"""
+    if not reply:
+        return None
+    m = _SONG_PICK_RE.search(str(reply))
+    if not m:
+        return None
+    try:
+        n = int(m.group(1))
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _strip_song_pick(reply):
+    """选版本时去掉 [PICK]/[ACT]弹琴 标签（系统代劳，避免 AI 再触发一次问句）。"""
+    out = _SONG_PICK_RE.sub("", reply or "")
+    out = _SONG_ACT_RE.sub("", out)
+    return out.strip()
+
+
+def _song_say(det, sess, state, text):
+    """在游戏里说一句话（走和 [CHAT] 完全相同的发送通道，不另造一套）。"""
+    if not text:
+        return
+    print(f"  [弹琴] 发消息: {text}")
+    if _send_msg(det, sess, text, state):
+        with state.lock:
+            state.recent_seen.append((text, time.time()))
+            state.sent_history.append((text, time.time()))
+
+
+def _song_resolve(candidates, text):
+    """调用 sky_song_player.resolve_choice 解析玩家选了第几个（模块缺失/异常都返回 None）。"""
+    try:
+        from sky_song_player import resolve_choice as _rc
+    except Exception as e:
+        print(f"  [弹琴] 曲谱模块不可用：{e}")
+        return None
+    try:
+        return _rc(candidates, text)
+    except Exception as e:
+        print(f"  [弹琴] 解析选择失败：{e}")
+        return None
+
+
+def _song_parse_result(raw):
+    """mcp() 返回的是 JSON 文本，这里安全地转成 dict。"""
+    try:
+        if isinstance(raw, str) and raw.strip().startswith("{"):
+            res = json.loads(raw)
+            return res if isinstance(res, dict) else {}
+    except ValueError as e:
+        print(f"  [弹琴] 返回不是 JSON：{e}")
+    return {}
+
+
+def _song_choice_question(query, matches):
+    """把候选拼成一句玩家能直接回答的话：带序号和版本名，方便 TA 只说"2"。
+
+    版本名本身就能区分（display_name 已去重），社区转录谱额外标一下来源，
+    但整体要短 —— 游戏聊天框放不下长句子。
+    """
+    from collections import Counter
+    q = str(query or "这首歌")
+    head, tail = f"「{q}」找到 {len(matches)} 个版本：", "。要哪个？说序号就行～"
+
+    def _parts(name_cap):
+        """把候选拼成 "1) 名字（时长）"；名字截到 name_cap 字。"""
+        short = []
+        for m in matches:
+            name = str(m.get("name") or m.get("label") or "")
+            short.append(name[:name_cap - 1] + "…" if len(name) > name_cap else name)
+        # 截断后撞车的（"千本樱 Senbonz…" 会出现两次）就不截断 + 补转录者
+        dup = {s for s, c in Counter(short).items() if c > 1}
+        out = []
+        for m, s in zip(matches, short):
+            name = str(m.get("name") or m.get("label") or "")
+            base = name if s in dup else s
+            if s in dup:
+                tb = str(m.get("transcribed_by") or "")
+                if tb:
+                    base += f"（{tb[:6]}）"
+            # 时长是同名谱最好用的区分信息（"2分49秒" vs "23秒"），没有就不写
+            dur = str(m.get("duration") or "")
+            out.append(f"{m.get('index')}) {base}" + (f"（{dur}）" if dur else ""))
+        return out
+
+    # 游戏聊天框放不下长句：先按 12 字拼，装不下就把名字砍到 8 字再拼一次，
+    # 还装不下就只列前几个（剩下的玩家可以直接念版本名 —— resolve_choice 认名字，
+    # 候选清单里仍然全都在）。
+    for cap in (12, 8):
+        parts = _parts(cap)
+        while len(parts) > 2 and len(head + " ".join(parts) + tail) > 90:
+            parts.pop()
+        if len(parts) == len(matches):
+            break
+    text = head + " ".join(parts) + tail
+    return text if len(text) <= 100 else text[:99] + "…"
+
+
+def _do_play_song(det, state, sess, query):
+    """执行一次点歌。
+
+    正常/失败只打日志（台词由 AI 自己的 [CHAT] 负责）；命中多个版本时把候选
+    挂到 state.pending_song_choice，并用一条 CHAT 问玩家要哪个版本。
+    """
+    query = (query or "").strip()
+    if not query:
+        _song_say(det, sess, state, "想听哪首？说个歌名我试试～")
+        return
+    # 0) 已经在问这首歌的版本了：别再问一遍（2026-11-01 真机日志里同一句问句发了两次，
+    #    是玩家答"版本3"没被识别 → 消息进了 LLM → AI 又回 [ACT]弹琴 造成的）。
+    with state.lock:
+        _pend = state.pending_song_choice
+    if _pend and str(_pend.get("query") or "").strip() == query:
+        print(f"  [弹琴] 已经在问「{query}」的版本了，不重复发问句")
+        return
+    # 1) 先只解析曲库（dry_run）：有几个版本、能不能弹 —— 这一步**不碰乐器界面**。
+    #    2026-11-01 真机事故：为了问一句版本先把乐器界面按开，紧接着发问句要按 C，
+    #    而 C 会把乐器界面关掉；玩家看到的就是"打开了又退出"，而且界面一挂，
+    #    后面连版本也选不成。所以顺序必须是：解析 → （需要时）问 → 确认界面 → 弹。
+    try:
+        pre = _song_parse_result(mcp("play_song", {"name": query, "dry_run": True},
+                                     session=sess))
+    except Exception as e:
+        print(f"  [弹琴] MCP 调用失败：{e}")
+        return
+    if not pre.get("ok"):
+        matches = [m for m in (pre.get("matches") or []) if isinstance(m, dict)]
+        if pre.get("reason") == "multiple_matches" and matches:
+            with state.lock:
+                state.pending_song_choice = {
+                    "query": pre.get("song_query") or query,
+                    "candidates": matches,
+                    "asked_at": time.time(),
+                }
+                state.pending_song_choice_at = time.time()
+            _song_say(det, sess, state, _song_choice_question(query, matches))
+            return
+        print(f"  [弹琴] 没弹成（{pre.get('reason') or '未知'}）："
+              f"{str(pre.get('message') or '')[:60]}")
+        # 查不到谱时**必须把事实告诉 AI**：以前这里只打日志、AI 拿不到失败原因，
+        # 于是它按自己刚才的台词继续"弹啦，你听听看""在弹啦，界面卡了一下"，
+        # 玩家听到的就是它明明没弹还嘴硬（2026-11-12 真机：7 次 not_found 全是这样）。
+        # force=True：同一首反复失败也要每次都送到，否则去重会把第 2~7 次吞掉。
+        if pre.get("reason") in ("not_found", "bad_choice"):
+            _sugg = [str(x) for x in (pre.get("suggestions") or []) if str(x).strip()][:5]
+            if _sugg:
+                _song_tell_ai(
+                    "[弹琴] 曲库里没有《%s》。最接近的有：%s。"
+                    "要弹其中哪首就直接 [ACT]弹琴:那一首的名字[/ACT]；"
+                    "都不要就换一首，或者先问问玩家想听什么。"
+                    % (query, "、".join("《%s》" % s for s in _sugg)),
+                    state, None, force=True)
+            else:
+                _song_tell_ai(
+                    "[弹琴] 曲库里没有《%s》，也没找到相近的。"
+                    "别再说自己在弹了，直接告诉玩家这首没有、换一首。" % query,
+                    state, None, force=True)
+        return
+    # 2) 版本唯一，这时才按快捷栏开乐器界面并用 YOLO 确认
+    #    按键前必须先把聊天面板关掉：面板开着时快捷栏数字键会被面板吃掉，
+    #    乐器界面根本不会开（13:45 真机日志里"按了 6 却没弹"的另一个原因）。
+    _close_panel(det, sess)
+    _ui_ok, _ui_why = _ensure_instrument_ui(sess, det=det)
+    if not _ui_ok:
+        if _ui_why == "slot_unknown":
+            _song_say(det, sess, state,
+                      "我还不知道乐器放在快捷栏第几格，运行 setup_song.bat 填一下就能弹了。")
+        elif _ui_why == "no_ui":
+            # 不再发失败台词：发消息要按 C，而 C 会把已经打开的乐器界面关掉
+            # （2026-11-09 真机：界面上来了却被判 no_ui，随后 C 把它关了）。
+            pass
+        print(f"  [弹琴] 未开始（{_ui_why}）")
+        return
+    if _ui_why == "unverified":
+        print("  [弹琴] 当前模型没有 instrument 类，无法确认乐器界面（已按槽位键，直接弹）")
+    try:
+        res = _song_parse_result(mcp("play_song", {
+            "name": query, "humanize": SONG_HUMANIZE,
+            "instrument": song_kind()}, session=sess))
+    except Exception as e:
+        print(f"  [弹琴] MCP 调用失败：{e}")
+        return
+    if res.get("ok"):
+        _song_clear_pending(state)      # 选定就不留待选，免得下一句被误当成"选版本"
+        print(f"  [弹琴] 开始弹奏：{res.get('song') or query}"
+              f"（乐器={res.get('instrument')} 拟人={res.get('humanize')}）")
+        # 弹奏期间的后台看护：停止信号 + 弹完收尾（关界面 + 告诉 AI）
+        _start_song_monitor(det, sess, state, getattr(state, "ai_q", None),
+                            res.get("song") or query)
+        return
+    if res.get("reason") == "multiple_matches":
+        matches = [m for m in (res.get("matches") or []) if isinstance(m, dict)]
+        if matches:
+            with state.lock:
+                state.pending_song_choice = {
+                    "query": res.get("song_query") or query,
+                    "candidates": matches,
+                    "asked_at": time.time(),
+                }
+                state.pending_song_choice_at = time.time()
+            _song_say(det, sess, state, _song_choice_question(query, matches))
+            return
+    print(f"  [弹琴] 没弹成（{res.get('reason') or '未知'}）："
+          f"{str(res.get('message') or '')[:60]}")
+
+
+def _handle_pending_song_choice(state, action_q, text, det=None):
+    """玩家这句是不是在回答"点歌选哪个版本"？
+
+    是 → 播对应版本 + 发一句确认，返回 True（调用方本轮不再调 LLM）；
+    不是（或已过期）→ 清掉待选并返回 False，让消息走正常 LLM 流程。
+    注意：ai_loop 没有 sess，这里让 mcp() 自己建一次会话（点歌是低频操作）。
+    """
+    with state.lock:
+        pending = state.pending_song_choice
+        asked_at = state.pending_song_choice_at
+    if not pending:
+        return False
+    cands = [c for c in (pending.get("candidates") or []) if isinstance(c, dict)]
+    if not cands or asked_at <= 0 or (time.time() - asked_at) > SONG_CHOICE_TTL:
+        _song_clear_pending(state)
+        return False
+    picked = _song_resolve(cands, text)
+    if picked is None:
+        # 答非所问：**不要**立刻作废。2026-11-01 真机日志里两条历史 OCR 行
+        # （「包一下」「emm.晴天？」）把待选直接作废了，玩家再想选也没机会。
+        # 现在只有明确放弃、或超过 TTL 才清；其它情况保留待选，交给 LLM 正常回复。
+        if any(w in str(text) for w in SONG_GIVEUP_WORDS):
+            print(f"  [弹琴] 玩家说「{str(text)[:16]}」，作废待选")
+            _song_clear_pending(state)
+        else:
+            print(f"  [弹琴] 「{str(text)[:20]}」不像选版本，保留待选"
+                  f"（{SONG_CHOICE_TTL:.0f}s 后自动作废）")
+        return False
+    query = pending.get("query") or ""
+    _song_clear_pending(state)
+    song = str(picked.get("name") or query)
+    print(f"  [弹琴] 玩家选了第{picked.get('index')}个：{song}")
+    # 2026-11-01 修（两个 bug 一起）：
+    # ① 原来这里直接调 _ensure_instrument_ui(sess)，但 ai_loop 里没有 sess —— NameError 被
+    #    except 吞掉，结果"选了版本也永远不弹"；
+    # ② 就算有 sess，先开乐器界面再排 [CHAT] 确认台词，会让 _send_msg 去按 C 开聊天面板，
+    #    而 C 会把乐器界面 toggle 关掉。
+    # 正确顺序交给 action 线程 FIFO：先发台词（面板还开着）→ 再开界面 → 再弹。
+    action_q.put(("execute", f"[CHAT]好嘞，弹《{song}》～[/CHAT]"))
+    action_q.put(("play_song_confirm", query, str(text), song))
+    return True
+
+
+def _flush_song_deferred_chat(det, state, sess) -> None:
+    """把弹奏期间攒下的 CHAT 补发出去（会话结束后由 action 线程调用）。
+
+    只在**不在弹奏会话**时发；失败只记一笔，绝不抛异常（这是 action 线程）。
+    """
+    global _song_deferred_dropped
+    if _song_session_active or not _song_deferred_chat:
+        return
+    pending = _song_deferred_chat[:]
+    _song_deferred_chat.clear()
+    if _song_deferred_dropped:
+        print(f"  [弹琴] 弹奏期间消息超出队列，已丢弃 {_song_deferred_dropped} 条")
+        _song_deferred_dropped = 0
+    for m in pending:
+        print(f"  [弹琴] 补发弹奏期间攒下的消息: {m}")
+        try:
+            if _send_msg(det, sess, m, state):
+                with state.lock:
+                    state.recent_seen.append((m, time.time()))
+                    state.sent_history.append((m, time.time()))
+        except Exception as e:
+            print(f"  [弹琴] 补发失败（忽略）：{e}")
+        time.sleep(0.8)
 
 
 def _execute_reply(det, state, sess, reply):
@@ -1683,6 +3033,7 @@ def _execute_reply(det, state, sess, reply):
                     state.sent_history.append((msg, time.time()))
             time.sleep(1.0)  # 发送完消息后延迟1秒再执行后续操作
 
+    force_acts = extract_force_acts(reply)
     for act in extract_act_names(reply):
         if act == '回家牵手':
             if det.world.snapshot().screen == Screen.HOME:
@@ -1695,6 +3046,13 @@ def _execute_reply(det, state, sess, reply):
             while time.time() < deadline and not shutdown_event.is_set():
                 snap = det.world.snapshot()
                 if snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand"):
+                    # 光翼安全窗：与 watch 牵手(3132)、好友树(1513)、B2接受(4010) 同一道闸。
+                    # 硬门退出迟滞只有 WING_LIGHT_HOLD=2s，安全窗是 30s —— 检出光翼后
+                    # 2~30s 这段窗口里，只靠 _key 硬门是不够的（见第七十章 P0-1）。
+                    _f_ok, _f_why = f_prompt_press_allowed()
+                    if not _f_ok:
+                        print(f"  [Guard] 拒绝按 F 牵手：{_f_why}（本次不牵）")
+                        break
                     print("  [Action] 牵手图标在，按 F 牵住")
                     _key(sess, "f", 120)
                     with state.lock:
@@ -1706,6 +3064,12 @@ def _execute_reply(det, state, sess, reply):
             continue
         # 好友树互动动作（抱抱等）：检测入口图标→F→导航→空格→ESC
         if act in FRIEND_TREE_NAV:
+            # 同一动作刚接受/发起完、且无新邀请图标（OCR 延迟读到旧请求的重复）：跳过动作只保留台词。
+            # 例外：AI 用 [ACT!] 明确表示"知道刚做过、仍要再做"（玩家明确要求或它自己想），照常发起。
+            if act not in force_acts and is_duplicate_initiate(state, act):
+                print(f"  [Action] {act} 刚和珂珂做过（{INITIATE_DEDUP_SECONDS:.0f}s 内、屏幕无新邀请），"
+                      f"跳过重复主动发起（台词照常）；若确实要再做，AI 应输出 [ACT!]{act}[/ACT]")
+                continue
             if _friend_tree_action(det, sess, state, act):
                 _reopen_panel_after_action(det, sess, state)
             continue
@@ -1714,6 +3078,20 @@ def _execute_reply(det, state, sess, reply):
             target_pose = POSE_ACTIONS[act]
             _do_pose_action(det, sess, state, target_pose, label=act)
             _reopen_panel_after_action(det, sess, state)
+            continue
+        # 停止弹琴：AI 判定"别弹了"时走这里，停曲 + ESC 退出乐器界面
+        if act in ('停止弹琴', '停弹琴', '别弹了', '不弹了'):
+            try:
+                mcp("stop_song", session=sess)
+            except Exception as e:
+                print(f"  [弹琴] 停止失败：{e}")
+            _key(sess, "escape", 120)
+            print("  [弹琴] 已停止弹奏并退出乐器界面")
+            continue
+        # 点歌：不是按键动作，走 MCP play_song（异步后台发键）；
+        # 格式 [ACT]弹琴:歌名[/ACT]，同名多版本时由 _do_play_song 把候选存起来并问玩家
+        if act == '弹琴' or act.startswith('弹琴:'):
+            _do_play_song(det, state, sess, act.split(':', 1)[1] if ':' in act else "")
             continue
 
         k = ACT_KEYS.get(act)
@@ -1751,9 +3129,9 @@ def _execute_reply(det, state, sess, reply):
                     close_attempts += 1
                 if panel_open(det) is True:
                     print("  [Action] 警告：聊天面板可能还开着，继续执行")
-                # 步骤2：按快捷栏第5格（回遇境）
-                print("  [Action] 按快捷栏第5格（回遇境）")
-                _key(sess, "5", 80)
+                # 步骤2：按回遇境快捷栏键（槽位可在 setup 配置，跟随 ACT_KEYS）
+                print("  [Action] 按回遇境快捷栏键（槽位 %s）" % k)
+                _key(sess, k, 80)
                 time.sleep(0.5)
                 # 步骤3：等待确认对话框出现（最多8秒）
                 print("  [Action] 等待确认对话框...")
@@ -1863,6 +3241,8 @@ def fix(t):
     t = re.sub(r'(^|[\s，。！？!?…~～,])亨星河', r'\1哼星河', t)
     # "好啦"被认成"子啦"（"子啦"不成词；"子"单字不碰，保护孩子/桌子/兔子）
     t = t.replace("子啦", "好啦")
+    # "抱抱"被认成"泡抱"（"泡抱"不成词；2026-11-01 真机：星河把"泡抱"当新词反问）
+    t = t.replace("泡抱", "抱抱")
     # 句末语气词"欸"(口+矣)被 OCR 按偏旁认成"俟"(亻+矣)/"埃"(土+矣)：
     # 玩家说的是"雨林欸"。雨林俟/雨林埃→雨林欸；林俟/林埃（"雨"也漏识）→雨林欸。
     # 交替长串优先，不产生雨雨林；只在"雨林"组合内纠，不碰尘埃/俟机等正常词。
@@ -2295,8 +3675,6 @@ def _guard_should_reopen(snap, panel_state, panel_closed_since, t0,
     if t0 - panel_closed_since <= PANEL_REOPEN_DELAY:
         return False
     if busy or sending or not action_empty:
-        return False
-    if MEM_READER_ENABLED:
         return False
     if t0 - last_action <= POST_ACTION_GRACE:
         return False
@@ -2822,16 +4200,21 @@ def watch_loop(det: PanelDetector, state: SharedState,
             global _yolo_open_tree_detected, _yolo_open_tree_conf, _yolo_accept
             global _yolo_preview_boxes, _yolo_preview_time
             global _yolo_wing_light_seen, _yolo_wing_light_frames, _yolo_wing_light_last_seen
+            global _settings_frames, _settings_state
+            global _instrument_guard_frames, _instrument_guard_state
+            global _yolo_instrument_detected
             if _yolo_model is not None and t0 - _yolo_last_detect_time > YOLO_DETECT_INTERVAL:
                 _yolo_last_detect_time = t0
                 frame = _loop_frame()   # 本拍共用一帧（原每拍最多拷 3 次 6.2MB 全帧）
                 if frame is not None:
                     try:
-                        results = _yolo_model(frame, conf=YOLO_CONF_THRESHOLD, verbose=False)
+                        results = _yolo_model(frame, conf=YOLO_CONF_THRESHOLD, imgsz=YOLO_IMGSZ, verbose=False)
                         found_hand = False
                         found_open_tree = False
                         found_chat_input = False
                         found_wing_light = False
+                        found_settings = False
+                        found_instrument = False
                         max_hand_conf = 0.0
                         max_open_tree_conf = 0.0
                         max_chat_input_conf = 0.0
@@ -2847,23 +4230,29 @@ def watch_loop(det: PanelDetector, state: SharedState,
                                 name = results[0].names[cls]
                                 x1, y1, x2, y2 = map(float, box.xyxy[0])
                                 preview_boxes.append((cls, conf, (x1, y1, x2, y2), name))
-                                if name == "hand_icon":
+                                if name == "hand_icon" and conf >= HAND_CONF:
                                     found_hand = True
                                     if conf > max_hand_conf:
                                         max_hand_conf = conf
                                         best_hand_bbox = (x1, y1, x2, y2)
-                                elif name == "open_tree_icon":
+                                elif name == "open_tree_icon" and conf >= OPEN_TREE_CONF:
                                     found_open_tree = True
                                     max_open_tree_conf = max(max_open_tree_conf, conf)
                                 elif name == WING_LIGHT_CLASS_NAME and conf >= WING_LIGHT_CONF:
                                     # 光翼拾取图标（无翼绝不能按 F）：本拍标记，防抖/迟滞在检测后统一处理
                                     found_wing_light = True
                                     max_wing_conf = max(max_wing_conf, conf)
-                                elif cls in ACCEPT_CLASSES:
+                                elif name == "instrument" and conf >= INSTRUMENT_CONF:
+                                    # 乐器界面（v7 类 22）：弹琴前用它确认"真的开了"
+                                    found_instrument = True
+                                elif name == "settings_menu" and conf >= SETTINGS_CONF:
+                                    # 误触 ESC/动作键会弹出设置菜单，之后所有键都打进菜单里
+                                    found_settings = True
+                                elif cls in ACCEPT_CLASSES and _accept_classmap_verified:
                                     aname = ACCEPT_CLASSES[cls][0]
                                     if aname not in found_accept or conf > found_accept[aname][0]:
                                         found_accept[aname] = (conf, (x1, y1, x2, y2))
-                                elif name == "chat_input":
+                                elif name == "chat_input" and conf >= CHAT_CONF:
                                     # 位置约束：根据实测 chat_input 在 (0,712,728,818) 附近
                                     fh, fw = frame.shape[:2]
                                     # 输入框贴屏幕底边(y2≈H)：上限放到 1.02H（2026-09-03 换显卡后
@@ -2885,6 +4274,7 @@ def watch_loop(det: PanelDetector, state: SharedState,
                         _yolo_open_tree_detected = found_open_tree
                         _yolo_open_tree_conf = max_open_tree_conf
                         _yolo_accept = found_accept
+                        _yolo_instrument_detected = found_instrument
                         _yolo_preview_boxes = preview_boxes
                         _yolo_preview_time = t0
                         # wing_light 光翼硬门：纯函数状态机推进一拍（防抖进入、迟滞退出）
@@ -2893,9 +4283,53 @@ def watch_loop(det: PanelDetector, state: SharedState,
                             wing_light_step(found_wing_light, t0, _yolo_wing_light_seen,
                                             _yolo_wing_light_frames, _yolo_wing_light_last_seen)
                         if _yolo_wing_light_seen and not _prev_seen:
-                            print("  [Guard] 附近检出光翼，进入防护：拦截 F（无翼保护，不拾取）")
+                            if AUTO_PICKUP_WING:
+                                print("  [Guard] 附近检出光翼（有翼号，自动拾取已开启）")
+                            else:
+                                print("  [Guard] 附近检出光翼，进入防护：拦截 F（无翼保护，不拾取）")
                         elif _prev_seen and not _yolo_wing_light_seen:
                             print("  [Guard] 已离开光翼范围，解除 F 拦截")
+                        # 把防护态同步到 MCP（状态变化立即推；防护期间每 10s 重申一次）
+                        _push_wing_guard(_yolo_wing_light_seen, t0)
+                        # 设置菜单误开守卫：连按 ESC 关掉（首按 → 3s → 15s，最多 3 次）
+                        if SETTINGS_GUARD_ENABLED:
+                            _settings_frames = (_settings_frames + 1) if found_settings else 0
+                            _settings_ok = _settings_frames >= SETTINGS_CONFIRM_FRAMES
+                            # 聊天面板开着时不动手：ESC 会把聊天框关掉，反而打断对话
+                            _settings_allowed = (not _sending_msg
+                                                 and not getattr(snap.chat_open, "value", False))
+                            _s_act, _settings_state = settings_esc_plan(
+                                _settings_ok, t0, _settings_state, enabled=_settings_allowed)
+                            if _s_act == "press":
+                                print(f"  [Settings] 检出设置菜单，按 ESC 关闭"
+                                      f"（第 {_settings_state['presses']} 次）")
+                                _key(sess, "escape", 120)
+                            elif _s_act == "give_up":
+                                print("  [Settings] ⚠ 连续 3 次 ESC 仍未关掉设置菜单，"
+                                      "暂停处理 60s（可能是误检，可调 SKY_SETTINGS_CONF）")
+                        # 乐器界面误开守卫：非弹琴时检测到乐器界面，ESC 关闭（与设置守卫对称）
+                        if INSTRUMENT_GUARD_ENABLED:
+                            _instrument_guard_frames = (
+                                (_instrument_guard_frames + 1) if found_instrument else 0)
+                            _instrument_ok = _instrument_guard_frames >= INSTRUMENT_GUARD_FRAMES
+                            # 三重保险：不在弹琴会话（权威，正常弹琴绝不触发）、不发消息、面板没开
+                            # 第四重（2026-11-13）：只关**我们自己开的**界面。以前玩家手动打开
+                            # 乐器（不在弹琴会话里）会被判"误开"、2 帧后 ESC 掉，玩家没法自己弹琴
+                            # ——这是 11-11 记下的 P1。_ensure_instrument_ui 按槽位键时会记时间戳。
+                            _instrument_allowed = instrument_guard_allowed(
+                                _song_session_active, _sending_msg,
+                                getattr(snap.chat_open, "value", False),
+                                _instrument_opened_by_us_at, t0)
+                            _i_act, _instrument_guard_state = instrument_esc_plan(
+                                _instrument_ok, t0, _instrument_guard_state,
+                                enabled=_instrument_allowed)
+                            if _i_act == "press":
+                                print(f"  [Instrument] 非弹琴时检出乐器界面，按 ESC 关闭"
+                                      f"（第 {_instrument_guard_state['presses']} 次）")
+                                _key(sess, "escape", 120)
+                        # 光翼自动拾取（有翼号、SKY_AUTO_PICKUP_WING=1）：防抖确认后直接按 F，不走 AI
+                        if AUTO_PICKUP_WING:
+                            wing_pickup_step(sess, t0, _yolo_wing_light_seen)
                         # 好友互动邀请事件（防抖/去重/OCR/VLM 观测；约0.4s一次）
                         _handle_accept_events(det, state, frame, t0, interact_q, action_q)
                         if found_hand and DEBUG:
@@ -2949,25 +4383,30 @@ def watch_loop(det: PanelDetector, state: SharedState,
                         _yolo_hand_detected = False
                         continue
                     
-                    with state.lock:
-                        state.last_fhand_time = t0
-                        state.is_holding_hands = True
-                        state.hold_hands_start_time = t0
-                        # 牵手后角色会被拉起来，姿势重置为站着
-                        if state.pose_state != 'standing':
-                            print(f"  [Watch] 牵手，姿势从 {state.pose_state} 重置为 standing")
-                            state.pose_state = 'standing'
-                            state.pose_update_time = t0
-                    # 直接在 Watch 线程处理牵手，不等 Action 线程（图标出现时间很短）
-                    detect_source = "YOLO" if _yolo_hand_detected and not (snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand")) else "模板匹配"
-                    print(f"  [Watch] 伸手了({detect_source})，按 F 牵住 → 进入牵手状态")
-                    # 重置YOLO检测状态，避免重复按F
-                    _yolo_hand_detected = False
-                    # 光翼安全窗：牵手也是对着手伸图标按 F，与好友树入口同源风险
+                    # 光翼安全窗必须先过：守卫拒绝时绝不能先把 is_holding_hands 写成 True，
+                    # 否则会假牵手 180 秒（hold_hands_timeout=180）、8s 冷却被刷新，且 AI 提示词
+                    # 会以为正牵着手（见 2026-10-31 审计 P1）。
                     _f_ok, _f_why = f_prompt_press_allowed()
                     if not _f_ok:
                         print(f"  [Guard] 拒绝按 F 牵手：{_f_why}（本次不牵，8 秒后再看）")
+                        # 不写任何牵手状态；清掉本帧检测，避免同一图标在同一拍里反复触发
+                        _yolo_hand_detected = False
                     else:
+                        # 守卫通过、确定要按 F 了才落状态（顺序：守卫 → 写状态 → 按键）
+                        with state.lock:
+                            state.last_fhand_time = t0
+                            state.is_holding_hands = True
+                            state.hold_hands_start_time = t0
+                            # 牵手后角色会被拉起来，姿势重置为站着
+                            if state.pose_state != 'standing':
+                                print(f"  [Watch] 牵手，姿势从 {state.pose_state} 重置为 standing")
+                                state.pose_state = 'standing'
+                                state.pose_update_time = t0
+                        # 直接在 Watch 线程处理牵手，不等 Action 线程（图标出现时间很短）
+                        detect_source = "YOLO" if _yolo_hand_detected and not (snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand")) else "模板匹配"
+                        print(f"  [Watch] 伸手了({detect_source})，按 F 牵住 → 进入牵手状态")
+                        # 重置YOLO检测状态，避免重复按F
+                        _yolo_hand_detected = False
                         try:
                             if panel_open(det) is True:
                                 _key(sess, "c", 150)
@@ -2993,7 +4432,7 @@ def watch_loop(det: PanelDetector, state: SharedState,
 
             with state.lock:
                 last_ocr = state.last_chat_ocr_time
-            if panel_open(det) is True and not MEM_READER_ENABLED:
+            if panel_open(det) is True:
                 frame = _loop_frame()
                 need = False
                 _diff = -1.0   # 仅诊断：本拍帧差；-1 表示没有可比上一帧（首帧/尺寸变化）
@@ -3365,6 +4804,15 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             # 才进长期记忆，防止路人的话被整理器当成珂珂的事写进 profile。
             mem_recordable = _in_whitelist(_sender_name(player_raw))
 
+            # ── 1.5 待确认的点歌版本：这句是在回答"要哪个版本"吗？──
+            # 命中就播放并发一句确认，本轮不再调 LLM（省一轮 token、确定性 100%）
+            try:
+                if _handle_pending_song_choice(state, action_q, player_msg, det):
+                    continue
+            except Exception as e:
+                print(f"  [弹琴] 处理版本选择异常: {e}")
+                _song_clear_pending(state)
+
             # ── 2. 联网搜索判断 ──
             search_context = ""
             if SEARCH_ENABLED and needs_web_search(player_msg):
@@ -3422,6 +4870,11 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
             # ── 5. 组装增强 system prompt ──
             system_with_memory = SYSTEM
             system_with_memory += "\n\n## 长期记忆\n" + memory_prompt(state.memory)
+            system_with_memory += (
+                "\n\n## 游戏聊天 OCR 容错\n"
+                "你看到的珂珂消息来自游戏画面 OCR，可能有错字（例如「抱抱」被认成「泡抱」、"
+                "「星河」被认成「星何」）。遇到像动作/弹琴/话题请求的错字，按最可能的本意理解并直接回应，"
+                "不要反问「这是什么新词」。")
             if style_context:
                 system_with_memory += "\n\n## 说话风格参考\n" + style_context
             # 珂珂真实说话习惯画像（从 raw_turns 统计，纯本地；2026-10-19 新增）
@@ -3550,6 +5003,35 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
                     "你之前已经对它反应过了（不要重复“怎么突然…”的惊讶）。玩家现在可能正在和你聊这件事、或催你；"
                     "自然地接上对话即可，比如同意就说“好，抱你”之类。你可以在心里决定接不接受，但现在不能自己按 F"
                     "（要等阶段3程序执行），这一步也不要输出任何动作标签。")
+
+            # 近期互动注入：让 AI 知道刚抱过/摸过，避免把 OCR 延迟读到的旧请求当新请求、又主动发起一次同一个动作
+            _inter_prompt = build_recent_interaction_prompt(state)
+            if _inter_prompt:
+                system_with_memory += _inter_prompt
+
+            # ── 点歌版本待选（2026-11-01）：把候选清单直接喂给 AI，由它理解玩家的话
+            #    后输出 [PICK]序号[/PICK]，不再靠死板词表猜。正则解析只当快速通道。
+            with state.lock:
+                _pend_song = state.pending_song_choice
+                _pend_song_at = state.pending_song_choice_at
+            if _pend_song and (time.time() - _pend_song_at) <= SONG_CHOICE_TTL:
+                _song_cands = [c for c in (_pend_song.get("candidates") or [])
+                               if isinstance(c, dict)]
+                if _song_cands:
+                    system_with_memory += (
+                        "\n\n## 正在等珂珂选版本（点歌：%s）\n"
+                        "版本清单：\n%s\n"
+                        "如果珂珂这句话是在选版本（怎么说都行：序号、版本名、时长、"
+                        "「就刚才那个」「随便」都可以），你必须输出 [PICK]序号[/PICK]，"
+                        "序号取清单里的数字。\n"
+                        "如果珂珂不是在选版本（在聊别的），正常回话，不要输出 [PICK]。\n"
+                        "输出 [PICK] 时不要再输出 [ACT]弹琴——系统会自动开始弹选中的版本。"
+                        % (_pend_song.get("query") or "这首歌",
+                           "\n".join("%d) %s%s" % (
+                               c.get("index"),
+                               c.get("name") or "",
+                               ("（%s）" % c.get("duration")) if c.get("duration") else "")
+                               for c in _song_cands)))
 
             # 视觉不再做“固定触发词预识别”：改为在第7步注册 look_at_screen 工具，
             # 由模型自己判断何时看画面（场景/姿势/前方物体/图标都能问）。
@@ -3781,7 +5263,31 @@ def ai_loop(det, state: SharedState, ai_q: queue.Queue,
                 _ai_trace_write(
                     "---- 程序最终处理 ----\n判定=发送\n最终发出CHAT=%s\n---- reply标签全文 ----\n%s"
                     % (chat_text, reply))
-            action_q.put(("execute", reply))
+            # AI 选版本（[PICK]N[/PICK]）：先发它自己的台词，再由 action 线程开界面弹。
+            _song_pick = _song_pick_from_reply(reply)
+            if _song_pick is not None:
+                with state.lock:
+                    _pend_now = state.pending_song_choice
+                _cands_now = [c for c in ((_pend_now or {}).get("candidates") or [])
+                              if isinstance(c, dict)]
+                _chosen = next((c for c in _cands_now
+                                if int(c.get("index") or 0) == _song_pick), None)
+                if _chosen is not None:
+                    print(f"  [弹琴] AI 读懂选择：第{_song_pick}个 {_chosen.get('name')}")
+                    _song_clear_pending(state)
+                    _stripped = _strip_song_pick(reply)
+                    if not _stripped:
+                        _stripped = f"[CHAT]好嘞，弹《{_chosen.get('name')}》～[/CHAT]"
+                    action_q.put(("execute", _stripped))
+                    action_q.put(("play_song_confirm",
+                                  (_pend_now or {}).get("query") or "",
+                                  str(_song_pick),
+                                  _chosen.get("name") or ""))
+                else:
+                    print(f"  [弹琴] AI 选了清单外的序号 {_song_pick}，忽略")
+                    action_q.put(("execute", _strip_song_pick(reply) or reply))
+            else:
+                action_q.put(("execute", reply))
 
             # ── 10. 发完再记入记忆 / 触发记忆整理（仅白名单玩家，
             #     防路人消息污染长期记忆；2026-10-19） ──
@@ -3804,6 +5310,11 @@ def action_loop(det: PanelDetector, state: SharedState,
     sess = _make_session()
 
     while not shutdown_event.is_set():
+        # 弹奏期间攒下的 CHAT 在这里补发（会话一结束就发，不必等新指令）
+        try:
+            _flush_song_deferred_chat(det, state, sess)
+        except Exception as e:
+            print(f"  [弹琴] 补发队列异常（忽略）：{e}")
         try:
             cmd = action_q.get(timeout=1.0)
         except queue.Empty:
@@ -3819,14 +5330,19 @@ def action_loop(det: PanelDetector, state: SharedState,
             elif cmd[0] == "go_home":
                 _go_home_action(det, state, sess)
             elif cmd[0] == "accept_f":
-                print("  [Action] 伸手了，按 F 牵住")
-                _close_panel(det, sess)
-                _key(sess, "f", 120)
-                time.sleep(0.8)
-                snap = det.world.snapshot()
-                if snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand"):
-                    print("  [Action] 图标还在，再按一次 F")
+                # 光翼安全窗（与其它 F 出口同一道闸，见 f_prompt_press_allowed / 第七十章 P0-1）
+                _f_ok, _f_why = f_prompt_press_allowed()
+                if not _f_ok:
+                    print(f"  [Guard] 拒绝按 F 牵手：{_f_why}（本次不牵）")
+                else:
+                    print("  [Action] 伸手了，按 F 牵住")
+                    _close_panel(det, sess)
                     _key(sess, "f", 120)
+                    time.sleep(0.8)
+                    snap = det.world.snapshot()
+                    if snap.f_prompt.value and snap.f_prompt_name.startswith("f_hand"):
+                        print("  [Action] 图标还在，再按一次 F")
+                        _key(sess, "f", 120)
             elif cmd[0] == "accept_invite":
                 # 阶段3：拟人接受好友互动邀请。normal=先发台词后延迟2s；fallback=兜底不延迟。
                 _, aname, cn, reason = cmd
@@ -3865,7 +5381,38 @@ def action_loop(det: PanelDetector, state: SharedState,
                                 _key(sess, "f", 120)
                                 time.sleep(0.8)
                             _accept_verdict[aname] = "done"
+                            record_interaction(state, cn, "accepted")
                             print(f"  [阶段3] {cn} 接受完成")
+            elif cmd[0] == "play_song_confirm":
+                # 版本已选好：上一条 execute 已把"好嘞，弹《X》"发完（面板开着），
+                # 这里再按快捷栏开乐器界面、确认后排入播放。
+                _, query, choice_text, song_name = cmd
+                # 刚才那条确认台词让面板留在开着状态；快捷栏数字键在面板开着时会被吃掉，
+                # 所以先关面板再按槽位键。
+                _close_panel(det, sess)
+                _ui_ok, _ui_why = _ensure_instrument_ui(sess, det=det)
+                if not _ui_ok:
+                    print(f"  [弹琴] 选完版本但乐器界面不在（{_ui_why}），未播放")
+                    # 不再发失败台词：发消息按 C 会关掉可能已经开着的乐器界面
+                else:
+                    try:
+                        res = _song_parse_result(mcp("play_song", {
+                            "name": query, "choice": choice_text,
+                            "humanize": SONG_HUMANIZE,
+                            "instrument": song_kind()}, session=sess))
+                    except Exception as e:
+                        print(f"  [弹琴] 播放失败：{e}")
+                        res = {}
+                    if res.get("ok"):
+                        song = str(res.get("song") or song_name)
+                        print(f"  [弹琴] 开始弹奏：{song}"
+                              f"（乐器={res.get('instrument')} 拟人={res.get('humanize')}）")
+                        _start_song_monitor(det, sess, state,
+                                            getattr(state, "ai_q", None), song)
+                    else:
+                        print(f"  [弹琴] 选完版本但没弹成（{res.get('reason')}）")
+                        _song_close_instrument(sess)
+                        _song_say(det, sess, state, "这首没能开始弹，换个时候再试试～")
             elif cmd[0] == "reopen":
                 try:
                     det.dump_evidence("reopen")
@@ -3986,8 +5533,7 @@ def setup_run_log():
             platform.python_version(), platform.system(), platform.release()))
         print("cwd=" + os.getcwd())
         print("脚本=" + os.path.abspath(__file__))
-        print("聊天输入=%s | LLM=%s/%s | 按键后端=%s" % (
-            "内存读取" if MEM_READER_ENABLED else "OCR截图",
+        print("聊天输入=OCR截图 | LLM=%s/%s | 按键后端=%s" % (
             LLM_PROVIDER, MODEL, BACKEND))
         print("白名单=%s %s | 联网搜索=%s" % (
             WHITELIST_ENABLED, WHITELIST, SEARCH_ENABLED))
@@ -4089,6 +5635,16 @@ def _ai_trace_write(block):
 # ===================== 主函数 =====================
 
 def main():
+    # 单实例锁（2026-11-01 P0）：必须在任何按键/记忆读写之前拿；拿不到就别启动。
+    _lock_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "user_data", "loop.lock")
+    _lock_ok, _lock_holder = acquire_instance_lock(_lock_path)
+    if not _lock_ok:
+        print("  [Lock] ⚠ 已有主循环在运行（%s）—— 本实例退出，避免抢键盘/记忆互相覆盖"
+              % (_lock_holder or "未知"))
+        return
+    atexit.register(release_instance_lock)
+
     setup_run_log()  # 启动即落 TXT 日志（logs/，保留最近5次）
     setup_ai_trace()  # SKY_AI_TRACE=1 时另开 AI 对话转储 logs/ai_trace_*.txt
     if not SYSTEM:
@@ -4106,7 +5662,7 @@ def main():
     print(f"光遇循环调度 v7.1 (sky-companion 聊天引擎 + PanelDetector)")
     print(f"  LLM: {LLM_PROVIDER} / {MODEL}")
     print(f"  搜索: {'开启' if SEARCH_ENABLED else '关闭'}")
-    print(f"  聊天输入: {'内存读取' if MEM_READER_ENABLED else 'OCR截图'}")
+    print("  聊天输入: OCR截图")
     print("=" * 40)
 
     # 0. 分层记忆补压缩（启动时检查：已结束的周/月/年没总结就补；低频、游戏外）
@@ -4168,14 +5724,25 @@ def main():
     det.world.on_change = on_change
 
     # 3.5 加载 YOLO 模型（可选）
-    global _yolo_model, _wing_light_guard_online
+    global _yolo_model, _wing_light_guard_online, _accept_classmap_verified
+    global _instrument_class_online
     if YOLO_ENABLED:
         try:
             from ultralytics import YOLO
             if os.path.exists(YOLO_MODEL_PATH):
-                _yolo_model = YOLO(YOLO_MODEL_PATH)
-                print(f"  [YOLO] 模型加载成功: {os.path.basename(YOLO_MODEL_PATH)}")
-                print(f"  [YOLO] 置信度阈值: {YOLO_CONF_THRESHOLD}")
+                from yolo_backend import load_yolo_model
+                _yolo_model = load_yolo_model(YOLO_MODEL_PATH)
+                try:
+                    _n_cls = len(_yolo_model.names or {})
+                except Exception:
+                    _n_cls = -1
+                print(f"  [YOLO] 模型加载成功: {os.path.basename(YOLO_MODEL_PATH)}"
+                      f"（{_n_cls} 类）")
+                print(f"  [YOLO] 置信度阈值: {YOLO_CONF_THRESHOLD} | 推理尺寸: {YOLO_IMGSZ}")
+                try:
+                    _yolo_model.overrides["imgsz"] = YOLO_IMGSZ
+                except Exception:
+                    pass
                 # 光翼硬门可见性（修 P0-3）：模型里没有 wing_light 类 = 硬门根本不会亮。
                 # 例如回退旧 7 类 sky_v4_7cls（无该类）时，此前是完全静默的。
                 try:
@@ -4187,6 +5754,30 @@ def main():
                     print("  [Guard] ⚠ 该模型没有光翼类（wing_light），光翼硬门实际未生效！"
                           f"（当前查找的类名='{WING_LIGHT_CLASS_NAME}'，"
                           "换模型后可用 SKY_WING_LIGHT_CLASS_NAME 对齐）")
+                # 类别表校验（2026-11-01）：ACCEPT_CLASSES 是按 class id 硬编码的。                # 换模型时若类别顺序变了，就会"检出 A、执行 B"，而且完全静默——这是
+                # 最危险的静默失效之一（会给陌生人按 F、把熊抱当抱抱），所以不一致时
+                # 直接关掉互动接受，只保留识别与日志。
+                try:
+                    _names_map = dict(_yolo_model.names or {})
+                except Exception:
+                    _names_map = {}
+                _mm = classmap_mismatches(_names_map)
+                _accept_classmap_verified = not _mm
+                if _mm:
+                    print("  [YOLO] ⚠ 类别表与代码映射不一致，**互动接受已自动关闭**"
+                          "（防错位误按 F）。逐条对照：")
+                    for _cid, _exp, _got in _mm[:10]:
+                        print(f"      id={_cid} 代码期望={_exp} 模型实际={_got}")
+                    print("      处理：按 yolo_classes_*.md 核对 data.yaml/classes.txt，"
+                          "或把 ACCEPT_CLASSES 的 id 对齐新模型后再开。")
+                # 弹琴确认闸：模型里有 instrument 类才可能验证"乐器界面真的开了"
+                try:
+                    _instrument_class_online = "instrument" in set(_names_map.values())
+                except Exception:
+                    _instrument_class_online = False
+                if not _instrument_class_online:
+                    print("  [弹琴] 当前模型没有 instrument 类，乐器界面无法验证"
+                          "（仍会按槽位键打开，但不做确认）")
             else:
                 print(f"  [YOLO] 模型文件不存在: {YOLO_MODEL_PATH}")
                 print("  [YOLO] 将使用模板匹配检测牵手图标")
@@ -4208,6 +5799,17 @@ def main():
         _guard_desc = "未生效（YOLO 不可用或模型无光翼类）"
     print("光翼硬门=%s | UI提示F安全窗=%.0fs（最近见过光翼则禁止对着F提示按）" % (
         _guard_desc, WING_LIGHT_F_SAFE_WINDOW))
+    print("光翼自动拾取=%s（%s）" % ("开启" if AUTO_PICKUP_WING else "关闭", _PICKUP_REASON))
+    print("  设置：%s（改设置运行 setup_wing.bat；settings.json 在本地、不进仓库）"
+          % _describe_wing_settings(_WING_SETTINGS))
+    print("弹琴：%s | 拟人化=%d | 停止词=%s（改快捷栏/乐器运行 setup_song.bat）" % (
+        describe_song_settings(), SONG_HUMANIZE, SONG_STOP_WORDS or "关闭"))
+    print("  %s（当前可改 user_data/keybind_settings.json，键位向导随统一菜单提供）"
+          % describe_keybind_settings())
+    if os.environ.get("SKY_AUTO_PICKUP_WING", "").strip().lower() in ("1", "true", "yes", "on") \
+            and not AUTO_PICKUP_WING:
+        print("  [Guard] ⚠ 你设了 SKY_AUTO_PICKUP_WING=1，但账号没标记为有翼号，"
+              "已**强制关闭**拾取（无翼捡光翼不可逆）。确认是有翼号就运行 setup_wing.bat。")
     if WING_LIGHT_GUARD_ENABLED and not _wing_light_guard_online and not F_ALLOW_WITHOUT_GUARD:
         print("  [Guard] ⚠ 硬门未生效期间：好友树/牵手类动作不会按 F（fail-safe，宁可不抱）；"
               "确认环境安全可设 SKY_F_ALLOW_WITHOUT_GUARD=1 放行")
@@ -4220,60 +5822,17 @@ def main():
         print("  [互动邀请] 提示：SKY_ACCEPT_CONF=%.2f < SKY_YOLO_CONF=%.2f，同上被后者卡住。"
               % (ACCEPT_CONF, YOLO_CONF_THRESHOLD))
 
+    # 启动即把 MCP 侧防护态清零：上一次会话若崩在防护态，MCP 会一直拦 F；
+    # 新会话从干净状态开始，之后由 watch 线程按真实检出结果推送。
+    _push_wing_guard(False)
+
     state = SharedState()
     ocr_q = queue.Queue(maxsize=2)
     ai_q = queue.Queue(maxsize=1)
     action_q = queue.Queue(maxsize=8)
     interact_q = queue.Queue(maxsize=8)  # Delta B1：好友互动邀请事件（watch 投递，ai 优先处理）
-
-    # 内存读取回调：把消息放入AI队列
-    mem_reader = None
-    if MEM_READER_ENABLED:
-        from mem_reader import MemoryChatReader
-        def _on_mem_message(formatted_msgs):
-            """内存读取到新消息时的回调。"""
-            now = time.time()
-            with state.lock:
-                # 去重
-                new_msgs = []
-                for m in formatted_msgs:
-                    if not _seen_before(state, m, now):
-                        state.recent_seen.append((m, now))
-                        new_msgs.append(m)
-                if not new_msgs:
-                    return
-                # 判断是否有白名单消息
-                has_whitelist = bool(_latest_whitelist_msg(new_msgs))
-            try:
-                ai_q.put_nowait((new_msgs, has_whitelist))
-                if DEBUG:
-                    print(f"  [MemReader] 送入AI队列: {new_msgs}")
-            except queue.Full:
-                try:
-                    ai_q.get_nowait()
-                    ai_q.put_nowait((new_msgs, has_whitelist))
-                except queue.Empty:
-                    pass
-
-        wl = WHITELIST if WHITELIST_ENABLED else None
-        mem_reader = MemoryChatReader(_on_mem_message, whitelist=wl, ai_name=AKI)
-        # 预注册已知的sender_id（珂珂的ID可能随游戏版本变化）
-        from mem_reader import load_uuid_map, save_uuid_map
-        uuid_map = load_uuid_map()
-        known_ke_ids = [
-            'd238d9a1-f21c-47e7-b57a-b0ff6d5537a5',
-            '72682bfc-a667-4738-8a6d-7b5a3c658422',
-        ]
-        changed = False
-        for sid in known_ke_ids:
-            if sid not in uuid_map:
-                uuid_map[sid] = '珂珂'
-                changed = True
-        if changed:
-            save_uuid_map(uuid_map)
-        mem_reader.uuid_map = uuid_map
-        mem_reader.start()
-        print("  [MemReader] 内存聊天读取已启用（跳过OCR聊天识别）")
+    # 弹琴停止监视需要往 AI 队列喂 OCR 到的聊天（state 上挂一份引用，供后台线程取用）
+    state.ai_q = ai_q
 
     threads = [
         threading.Thread(target=watch_loop, args=(det, state, ocr_q, action_q, interact_q),
@@ -4283,10 +5842,9 @@ def main():
         threading.Thread(target=action_loop, args=(det, state, action_q),
                          name="Action", daemon=True),
     ]
-    # 只有未启用内存读取时才启动OCR线程
-    if not MEM_READER_ENABLED:
-        threads.insert(1, threading.Thread(target=ocr_loop, args=(det, state, ocr_q, ai_q),
-                         name="OCR", daemon=True))
+    # OCR 线程始终启动（内存读取模式已于 2026-10-31 移出运行时）
+    threads.insert(1, threading.Thread(target=ocr_loop, args=(det, state, ocr_q, ai_q),
+                     name="OCR", daemon=True))
     for t in threads:
         t.start()
 
@@ -4342,8 +5900,6 @@ def main():
     except KeyboardInterrupt:
         print("\n退出中...")
         shutdown_event.set()
-        if mem_reader:
-            mem_reader.stop()
         for t in threads:
             t.join(timeout=3.0)
         det.stop()

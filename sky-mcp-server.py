@@ -16,15 +16,27 @@ import io
 import json
 import os
 import secrets
+import socket
 import sys
 import tempfile
 import threading
 import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Callable
 
-SERVER_INFO = {"name": "sky-mcp-server", "version": "0.2.0-gpu-merge"}
+# 弹琴模块：曲谱解析 / 键位 / 播放时序，改编自 windhide/SkyMusicPlay-for-Windows
+# （CC BY-NC 4.0，已获作者授权，署名见 sky_song_player.py 文件头）。
+try:
+    import sky_song_player
+except Exception as _song_err:  # 缺失时不影响其余按键/聊天工具
+    sky_song_player = None
+    _SONG_IMPORT_ERROR = str(_song_err)
+else:
+    _SONG_IMPORT_ERROR = ""
+
+SERVER_INFO = {"name": "sky-mcp-server", "version": "0.3.0-song"}
 PROTOCOL_VERSION = "2025-03-26"
 LOCAL_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -65,9 +77,60 @@ class SkyError(RuntimeError):
     pass
 
 
+class HardwareLostError(SkyError):
+    """Arduino 硬件未连接 / 中途拔出 / 通信失败。
+
+    与前台安全错误区分：这个错误可以安全地用软件模拟补发当次按键，
+    而不是把整个动作中断掉。
+    """
+
+
+_LOG_FILE = None
+_LOG_LOCK = threading.Lock()
+
+
+def _mcp_log_file():
+    """懒打开 logs/mcp_时间.txt（和主循环的 loop_*.txt 并列，方便一起回传）。
+
+    为什么要有：MCP 窗口的日志只打在屏幕上（`wing guard <- ACTIVE`、按键拒绝原因都在这），
+    窗口一关就没了，出问题时没法复盘。`SKY_MCP_LOG=0` 可关闭，`SKY_LOG_DIR` 可改目录。
+    """
+    global _LOG_FILE
+    if _LOG_FILE is not None:
+        return _LOG_FILE
+    if os.environ.get("SKY_MCP_LOG", "1") == "0":
+        _LOG_FILE = False
+        return _LOG_FILE
+    try:
+        log_dir = os.environ.get("SKY_LOG_DIR") or os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "mcp_" + time.strftime("%Y%m%d_%H%M%S") + ".txt")
+        _LOG_FILE = open(path, "w", encoding="utf-8", buffering=1)
+        # 只留最近 5 份，和主循环 log 的策略一致，别把磁盘堆满
+        try:
+            olds = sorted(g for g in os.listdir(log_dir)
+                          if g.startswith("mcp_") and g.endswith(".txt"))
+            for g in olds[:-5]:
+                os.remove(os.path.join(log_dir, g))
+        except Exception:
+            pass
+    except Exception:
+        _LOG_FILE = False
+    return _LOG_FILE
+
+
 def log(message: str) -> None:
-    sys.stderr.write(f"[sky-mcp] {message}\n")
+    line = f"[sky-mcp] {message}\n"
+    sys.stderr.write(line)
     sys.stderr.flush()
+    f = _mcp_log_file()
+    if f:
+        try:
+            with _LOG_LOCK:
+                f.write(time.strftime("%H:%M:%S ") + line)
+        except Exception:
+            pass
 
 
 def load_optional(module_name: str):
@@ -107,14 +170,40 @@ class PcSkyController:
         self._vgamepad = None
         self._arduino = None
         self._serial_lock = threading.Lock()
+        # 硬件热插拔自适应：Arduino 在线就用真键盘，拔出/没插自动退回软件模拟
+        self._hardware_online = False
+        self._hw_lock = threading.Lock()
+        self._hw_monitor_stop = threading.Event()
+        self._hw_monitor_thread = None
+        self._last_software_warn = 0.0
+        self._hw_warn_interval = 300.0  # 软件模式下重复提示的节流间隔（秒）
+        # 光翼硬门在 MCP 层的镜像状态（2026-11-01）：由 sky-loop 通过 set_wing_guard 推送。
+        # 原先硬门只在 sky-loop 的 _key() 里，任何直接调用 MCP press_key("f") 的路径
+        # （外部脚本/其它会话/调试工具）都能绕过它。这里把它下沉到真正的输入边界。
+        self._wing_guard_active = False
+        self._wing_guard_at = 0.0
+        self._wing_guard_lock = threading.Lock()
+        # 弹琴（sky_song_player）
+        self._song_player = None
+        self._firmware_version = 2      # attach 时按 READY 横幅更新（v3 才支持 CHORD 真和弦）
+        self._us_layout_set = False     # 软件发键前是否已加载过英文键盘布局
+        self._chord_soft_fallback_notified = False
+        atexit.register(self._stop_song_on_exit)
 
     def status(self) -> dict[str, Any]:
+        with self._hw_lock:
+            hw_online = self._hardware_online
         return {
             "mode": "pc",
             "platform": sys.platform,
             "input_backend": self._select_input_backend_name(),
+            "input_backend_preferred": self._resolve_input_backend_name(),
+            "hardware_online": hw_online,
+            "arduino_port": self._probe_arduino_port(),
+            "software_fallback": self._software_fallback_name(),
             "ocr": self._detect_ocr_name(),
             "ocr_device": self._ocr_device,
+            "wing_guard": self.wing_guard_state(),
             "screenshot_max": {
                 "width": self.config.screenshot_max_width,
                 "height": self.config.screenshot_max_height,
@@ -134,20 +223,42 @@ class PcSkyController:
             raise SkyError("Missing dependency: Pillow. Run: pip install -r requirements.txt")
 
     def _select_input_backend_name(self) -> str:
-        return self._resolve_input_backend_name()
+        return self._effective_backend()
 
-    def _resolve_input_backend_name(self, backend: str | None = None) -> str:
-        backend = (backend or self.config.input_backend or "auto").lower().strip()
-        if backend != "auto":
-            if backend not in {"pyautogui", "pydirectinput", "gamepad", "arduino"}:
-                raise SkyError(f"Unsupported input backend: {backend}")
-            return backend
+    def _software_fallback_name(self) -> str:
+        """软件模拟兜底后端：优先 pydirectinput（SendInput + 硬件扫描码，
+        与 SkyAuto 同款，DirectX 游戏更可能收到），否则 pyautogui。"""
         if sys.platform.startswith("win") and load_optional("pydirectinput") is not None:
             return "pydirectinput"
         return "pyautogui"
 
+    def _resolve_input_backend_name(self, backend: str | None = None) -> str:
+        """用户/配置表达的"偏好"后端（不考虑硬件是否在线）。
+
+        auto 与 arduino 都表示"硬件优先"：插着板子用 Arduino 真键盘，
+        没插/拔出时自动退回软件模拟，由 `_effective_backend()` 做最终裁决。
+        """
+        backend = (backend or self.config.input_backend or "auto").lower().strip()
+        if backend == "auto":
+            return "arduino"  # 硬件优先；掉线时 _effective_backend 自动软兜底
+        if backend not in {"pyautogui", "pydirectinput", "gamepad", "arduino"}:
+            raise SkyError(f"Unsupported input backend: {backend}")
+        return backend
+
+    def _effective_backend(self, backend: str | None = None) -> str:
+        """本次按键实际使用的后端：Arduino 在线就用硬件，否则退回软件模拟。"""
+        preferred = self._resolve_input_backend_name(backend)
+        if preferred == "arduino":
+            with self._hw_lock:
+                online = self._hardware_online
+            return "arduino" if online else self._software_fallback_name()
+        return preferred
+
     def _input_module(self, backend: str | None = None):
-        backend = self._resolve_input_backend_name(backend)
+        backend = self._effective_backend(backend)
+        # 硬件/手柄有专用路径，不会进到这里；稳妥起见一律落到软件兜底
+        if backend in ("arduino", "gamepad"):
+            backend = self._software_fallback_name()
         if backend == "pydirectinput":
             if self._pydirectinput is None:
                 self._pydirectinput = load_optional("pydirectinput")
@@ -254,29 +365,183 @@ class PcSkyController:
             return ch340[0].device
         return None
 
+    def _probe_arduino_port(self):
+        """返回当前确实存在的 Arduino 端口名，没有返回 None。
+        配置了 --serial-port 时验证该端口仍在（板子拔出后端口会从列表消失）。"""
+        cfg = self.config.serial_port
+        if cfg:
+            try:
+                from serial.tools import list_ports
+                present = {p.device for p in list_ports.comports()}
+            except Exception:
+                return cfg  # 列端口本身失败时不武断判离线，信任手动配置
+            return cfg if cfg in present else None
+        return self._autodetect_arduino_port()
+
+    def _set_hardware_online(self, online: bool, reason: str = "") -> bool:
+        """更新硬件在线状态，仅在状态翻转时打印一次，返回是否发生翻转。"""
+        with self._hw_lock:
+            changed = self._hardware_online != online
+            self._hardware_online = online
+        if changed:
+            if online:
+                log("已连接 Arduino 硬件键盘（硬件注入恢复）")
+            else:
+                soft = self._software_fallback_name()
+                log(f"⚠ 未检测到 Arduino 硬件（{reason or '未插 / 已拔出'}），"
+                    f"自动退回软件模拟按键（{soft}，扫描码）；后台每 30 秒检测，插回后自动切回硬件")
+        return changed
+
+    def _attach_arduino(self) -> bool:
+        """幂等地尝试连上 Arduino：已连接或本次连上返回 True，探测不到/打开失败 False。
+        按键路径与后台监测线程共用这一处，保证重连逻辑只有一份。"""
+        with self._serial_lock:
+            if self._arduino is not None:
+                self._set_hardware_online(True)
+                return True
+            port = self._probe_arduino_port()
+            if not port:
+                self._set_hardware_online(False, reason="探测不到串口")
+                return False
+            s = None
+            try:
+                import serial
+                s = serial.Serial(port, 115200, timeout=1)
+                # 打开串口的 DTR 会让 Leonardo/Pro Micro 复位，ready 横幅晚 1~2 秒才打印；
+                # 跳过空行读到 ready 关键词为止，最多 3 秒。读不到也不判失败——
+                # 能在 VID 过滤后打开串口即认为是我们的板子（ready 仅用于日志）。
+                ready = ""
+                deadline = time.time() + 3.0
+                while time.time() < deadline:
+                    line = s.readline()
+                    if line and line.strip():
+                        text = line.decode(errors="ignore").strip()
+                        if text:
+                            ready = text
+                            if "ready" in text.lower():
+                                break
+                    time.sleep(0.1)
+            except Exception as e:
+                self._set_hardware_online(False, reason=f"串口打开失败 {port}: {e}")
+                if s is not None:
+                    try:
+                        s.close()
+                    except Exception:
+                        pass
+                return False
+            self._arduino = s
+            # v2 固件支持 RELEASE（松开所有键）：每次连上先清一遍悬键，
+            # 让"出错断开→重连"成为真正的自愈。v1 旧固件回 ERR，无害。
+            try:
+                s.write(b"RELEASE\n")
+                s.readline()
+            except Exception:
+                pass
+            # 解析固件版本：READY 横幅只在复位后打印一次、DTR 复位时序不保证能读到，
+            # 故横幅之外再用 v3 独有命令做一次"行为探测"交叉验证，两者不一致以探测为准。
+            import re
+            fw_version = None
+            if ready:
+                mver = re.search(r"ready\s*v?(\d+)", ready, re.IGNORECASE)
+                if mver:
+                    fw_version = int(mver.group(1))
+            # 行为探测：CHORD 7 1（n=7 超上限，且 n 后有空格使 s0 有效）。
+            #   v3 回 ERR badn；v2 无 CHORD 分支，回 ERR unknown。该命令不触发任何按键。
+            try:
+                s.reset_input_buffer()
+                s.write(b"CHORD 7 1\n")
+                probe = ""
+                t0 = time.time()
+                while time.time() - t0 < 1.0:
+                    ln = s.readline()
+                    if ln and ln.strip():
+                        probe = ln.decode(errors="ignore").strip().lower()
+                        break
+                if "badn" in probe:
+                    probe_ver = 3
+                elif "unknown" in probe:
+                    probe_ver = 2
+                else:
+                    probe_ver = None
+                if probe_ver is not None:
+                    if fw_version is not None and fw_version != probe_ver:
+                        log(f"固件横幅报告 v{fw_version} 与行为探测 v{probe_ver} 不一致，以行为探测为准")
+                    fw_version = probe_ver
+            except Exception:
+                pass
+            if fw_version is None:
+                fw_version = 2
+            self._firmware_version = fw_version
+            log(f"Arduino connected on {port} (firmware v{fw_version}): "
+                f"{ready or '(固件未上报 ready 横幅)'}")
+            self._set_hardware_online(True)
+            return True
+
     def _ensure_arduino(self):
+        """按键路径用：拿到已连串口；连不上抛 HardwareLostError（调用方据此软补发）。"""
         if self._arduino is not None:
             return self._arduino
-        port = self.config.serial_port
-        if not port:
-            port = self._autodetect_arduino_port()
-            if not port:
-                raise SkyError(
-                    "未指定 --serial-port 且自动探测不到 Arduino，"
-                    "请检查 USB 连接，或用 --serial-port COMx 手动指定")
-            log(f"Arduino 自动探测到串口 {port}")
-        import serial
-        self._arduino = serial.Serial(port, 115200, timeout=5)
-        ready = self._arduino.readline().decode().strip()
-        log(f"Arduino connected on {port}: {ready}")
-        # v2 固件支持 RELEASE（松开所有键）：每次连上先清一遍悬键，
-        # 让"出错断开→重连"成为真正的自愈。v1 旧固件回 ERR，无害。
-        try:
-            self._arduino.write(b"RELEASE\n")
-            self._arduino.readline()
-        except Exception:
-            pass
-        return self._arduino
+        if self._attach_arduino():
+            return self._arduino
+        raise HardwareLostError("Arduino 未连接，已退回软件模拟按键")
+
+    def _mark_hardware_lost(self, reason: str) -> None:
+        """通信中途失败：关串口、置离线（带状态翻转日志）。"""
+        self._drop_arduino()
+        self._set_hardware_online(False, reason=reason)
+
+    # ---- 后台硬件热插拔监测（每 30 秒）----
+    HW_POLL_INTERVAL = 30.0
+
+    # ---- 软件按键可靠性（无硬件/兜底时减少吞键）----
+    # 最小按压时长（keyDown→keyUp 之间，过短游戏会漏识别）；SendInput 失败重试次数。
+    SOFT_MIN_PRESS_MS = float(os.environ.get("SKY_SOFT_MIN_PRESS_MS", "50"))
+    SOFT_SEND_RETRIES = int(os.environ.get("SKY_SOFT_SEND_RETRIES", "3"))
+
+    def start_hardware_monitor(self) -> None:
+        """启动时调一次：立即探测当前硬件并打印后端，然后起 30 秒守护线程。
+        幂等：重复调用不会起多个线程。"""
+        if self._resolve_input_backend_name() != "arduino":
+            # 用户显式选了软件/手柄后端，就不需要硬件守护
+            return
+        self._attach_arduino()
+        if not self._hardware_online:
+            self._warn_software_mode(force=True)
+        if self._hw_monitor_thread is None:
+            self._hw_monitor_stop.clear()
+            t = threading.Thread(target=self._hw_monitor_loop, name="sky-hw-monitor", daemon=True)
+            self._hw_monitor_thread = t
+            t.start()
+
+    def _warn_software_mode(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_software_warn >= self._hw_warn_interval:
+            self._last_software_warn = now
+            if not force:
+                soft = self._software_fallback_name()
+                log(f"当前无 Arduino 硬件，使用软件模拟按键（{soft}）；插回板子后会自动切回硬件")
+
+    def _hw_monitor_loop(self) -> None:
+        while not self._hw_monitor_stop.wait(self.HW_POLL_INTERVAL):
+            try:
+                port = self._probe_arduino_port()
+                if port is None:
+                    # 设备不在：若之前连着，说明被拔出
+                    if self._arduino is not None:
+                        self._mark_hardware_lost("USB 被拔出")
+                    else:
+                        with self._hw_lock:
+                            self._hardware_online = False
+                        self._warn_software_mode()
+                else:
+                    # 设备在：没连就尝试连回（自动重连），已连则保持
+                    if self._arduino is None:
+                        self._attach_arduino()
+                    else:
+                        self._set_hardware_online(True)
+            except Exception as e:
+                # 监测线程永不因异常退出
+                log(f"硬件监测异常（忽略）: {e}")
 
     # 游戏窗口标题（精确前缀，不用泛匹配——"Sky"会误中 cmd 标题里的 sky-mcp-server）
     GAME_TITLE_PREFIXES = ("光·遇", "Sky: Children of the Light")
@@ -368,20 +633,32 @@ class PcSkyController:
                 s = self._ensure_arduino()
                 s.write(cmd.encode())
                 resp = s.readline().decode().strip()
+            except HardwareLostError:
+                raise  # 连接失败已在 _attach_arduino 内置离线状态
             except SkyError:
                 raise
             except Exception:
-                self._drop_arduino()
-                raise
+                self._mark_hardware_lost("通信中断/串口异常")
+                raise HardwareLostError("Arduino 通信中断，本次改用软件模拟")
             if resp != "OK":
-                self._drop_arduino()
-                raise SkyError(f"Arduino error: {resp!r}（已断开串口，下次调用自动复位重连）")
+                self._mark_hardware_lost(f"固件返回 {resp!r}")
+                raise HardwareLostError(f"Arduino 返回 {resp!r}，本次改用软件模拟")
 
     def _arduino_press(self, keycode: int, duration_ms: int = 80) -> None:
         self._arduino_cmd(f"PRESS {keycode} {duration_ms}\n")
 
     def _arduino_hotkey(self, key1: int, key2: int, duration_ms: int = 50) -> None:
         self._arduino_cmd(f"HOTKEY {key1} {key2} {duration_ms}\n")
+
+    def _arduino_chord(self, keycodes: list[int], duration_ms: int = 120) -> None:
+        """v3 固件 CHORD 命令：多个键同时按下、保持后一起松开（真和弦）。
+        仅在 _firmware_version>=3 时调用；USB HID 6KRO 上限 6 键。"""
+        keys = [int(k) for k in keycodes][:6]
+        if not keys:
+            return
+        ms = max(1, min(int(duration_ms), 2000))
+        cmd = "CHORD " + str(len(keys)) + " " + " ".join(str(k) for k in keys) + f" {ms}\n"
+        self._arduino_cmd(cmd)
 
     ARDUINO_KEY_MAP = {
     "enter": 176,
@@ -397,6 +674,11 @@ class PcSkyController:
     "9": 57, "0": 48,
     # 方向键（Arduino Keyboard 库键码）。固件 PRESS 透传任意键码，无需重烧
     "right": 215, "left": 216, "down": 217, "up": 218,
+    # 光遇 15 键琴键（ASCII 码，Arduino Keyboard.press 接受可打印字符）。
+    # 上排 y u i o p / 中排 h j k l ; / 下排 n m , . /
+    "y": 121, "u": 117, "i": 105, "o": 111, "p": 112,
+    "h": 104, "j": 106, "k": 107, "l": 108, ";": 59,
+    "n": 110, "m": 109, ",": 44, ".": 46, "/": 47,
 }
 
     def _clipboard(self):
@@ -418,25 +700,127 @@ class PcSkyController:
         self._pyautogui.PAUSE = 0.01
         return self._pyautogui
 
+    def _soft_event(self, inp, fn, key) -> bool:
+        """软件 keyDown/keyUp 的可靠包装：SendInput 没把事件插进去时重试。
+
+        pydirectinput 的 keyDown/keyUp 返回 bool（成功插入事件=True）；pyautogui 返回 None。
+        只把明确的 False 当失败重试，True/None 都视为成功（兼容 pyautogui）。"""
+        for attempt in range(max(1, self.SOFT_SEND_RETRIES)):
+            try:
+                ok = fn(key)
+            except Exception:
+                ok = False
+            if ok is not False:
+                return True
+            time.sleep(0.03 * (attempt + 1))
+        log(f"软件按键 {key} 经 {self.SOFT_SEND_RETRIES} 次仍未成功注入（可能被系统/游戏吞掉）")
+        return False
+
     def _press_combo(self, keys: list[str], duration_ms: int = 30, backend: str | None = None) -> None:
         if not keys:
             return
         inp = self._input_module(backend)
-        duration = max(0, int(duration_ms)) / 1000
+        # 软件按键保证最小按压时长，避免 down/up 太快被游戏吞掉（Arduino 走 _arduino_press，不经过这里）
+        duration = max(int(duration_ms), int(self.SOFT_MIN_PRESS_MS)) / 1000
         modifiers = keys[:-1]
         main = keys[-1]
         for mod in modifiers:
-            inp.keyDown(mod)
+            self._soft_event(inp, inp.keyDown, mod)
         try:
-            inp.keyDown(main)
+            self._soft_event(inp, inp.keyDown, main)
             time.sleep(duration)
-            inp.keyUp(main)
+            self._soft_event(inp, inp.keyUp, main)
         finally:
             for mod in reversed(modifiers):
                 try:
-                    inp.keyUp(mod)
+                    self._soft_event(inp, inp.keyUp, mod)
                 except Exception:
                     pass
+
+    def _ensure_us_keyboard_layout(self) -> None:
+        """软件发键前加载英文（美式）键盘布局，降低中文输入法/非英文布局吞键。
+
+        小技巧参考自 windhide amd_robot.py 的 set_us_keyboard_layout。
+        LoadKeyboardLayout 只把英文布局加载/激活到当前线程，不改动用户系统默认
+        布局；pydirectinput 本身走硬件扫描码，这一步是额外保险。幂等、失败静默。
+        """
+        if self._us_layout_set or not sys.platform.startswith("win"):
+            return
+        try:
+            import ctypes
+            ctypes.windll.user32.LoadKeyboardLayoutW("00000409", 1)  # 0x409=en-US, KLF_ACTIVATE=1
+            self._us_layout_set = True
+        except Exception:
+            pass
+
+    def _chord_soft(self, keys: list[str], duration_ms: int = 120, backend: str | None = None) -> None:
+        """软件后端真和弦：所有键一起 down、保持、再一起 up（各键地位平等）。"""
+        if not keys:
+            return
+        inp = self._input_module(backend)
+        self._ensure_us_keyboard_layout()
+        duration = max(int(duration_ms), int(self.SOFT_MIN_PRESS_MS)) / 1000
+        downed: list[str] = []
+        try:
+            for k in keys:
+                if self._soft_event(inp, inp.keyDown, k):
+                    downed.append(k)
+            time.sleep(duration)
+        finally:
+            for k in reversed(downed):
+                try:
+                    self._soft_event(inp, inp.keyUp, k)
+                except Exception:
+                    pass
+
+    def press_chord(self, keys: list[str], duration_ms: int = 120, backend: str | None = None) -> str:
+        """弹奏一个单音/和弦的统一出口（不抢焦点，供播放线程高频调用）。
+
+        - Arduino v3 固件：CHORD 真和弦（1~6 键）；
+        - Arduino v2 固件：单键 PRESS、双键 HOTKEY；三键及以上整组改软件兜底
+          （保证不丢音，仅提示一次）；
+        - 纯软件后端：pydirectinput/pyautogui 多键同时按下（真和弦）。
+        """
+        norm = [normalize_key(k) for k in keys if k]
+        if not norm:
+            return "empty chord"
+        # 播放途中不抢焦点，但严格模式下前台不是游戏就拒绝（避免打进别的窗口）。
+        if self._focus_strict() and not self._game_is_foreground():
+            raise SkyError("Sky window is not foreground: refusing to play note "
+                           "(set SKY_FOCUS_STRICT=0 to restore the unsafe behaviour)"
+                           f". 当前前台窗口=「{self._fg_title()}」")
+        resolved = self._effective_backend(backend)
+        if resolved == "arduino":
+            kcs = [self.ARDUINO_KEY_MAP.get(k) for k in norm]
+            if any(k is None for k in kcs):
+                soft = self._software_fallback_name()
+                self._chord_soft(norm, duration_ms, backend=soft)
+                return f"chord {norm} via {soft}(unmapped hardware key)"
+            try:
+                if self._firmware_version >= 3 or len(norm) <= 2:
+                    if len(norm) == 1:
+                        self._arduino_press(kcs[0], duration_ms)
+                    elif len(norm) == 2:
+                        self._arduino_hotkey(kcs[0], kcs[1], duration_ms)
+                    else:
+                        self._arduino_chord(kcs, duration_ms)
+                    return f"arduino chord {norm} for {int(duration_ms)}ms"
+                # v2 固件不支持三键和弦：整组软件兜底，保证不丢音。
+                soft = self._software_fallback_name()
+                if not self._chord_soft_fallback_notified:
+                    log("当前 Arduino 固件为 v2，不支持三键和弦；三音及以上已自动用软件"
+                        "模拟完整弹奏。烧录 sky_keyboard_v3 固件后可由硬件完整弹奏。")
+                    self._chord_soft_fallback_notified = True
+                self._chord_soft(norm, duration_ms, backend=soft)
+                return f"chord {norm} via {soft}(firmware v2, 3+ keys)"
+            except HardwareLostError:
+                soft = self._software_fallback_name()
+                log(f"硬件不可用，和弦 {norm} 改用软件模拟（{soft}）补发")
+                self._chord_soft(norm, duration_ms, backend=soft)
+                return f"chord {norm} via {soft}(hardware unavailable)"
+        # 纯软件后端（手柄无琴键映射，也落到软件兜底）
+        self._chord_soft(norm, duration_ms, backend=resolved)
+        return f"chord {norm} for {int(duration_ms)}ms via {resolved}"
 
     def _tap_key(self, key: str, duration_ms: int = 35, backend: str | None = None) -> None:
         key = normalize_key(key)
@@ -446,17 +830,47 @@ class PcSkyController:
             return
         self._press_combo([key], duration_ms, backend=backend)
 
+    def _software_modifier_v(self, soft: str) -> None:
+        if sys.platform == "darwin":
+            self._hotkey("command", "v", backend=soft)
+        else:
+            self._hotkey("ctrl", "v", backend=soft)
+
+    def _tap_with_fallback(self, key_name: str, keycode: int | None,
+                           duration_ms: int, backend: str | None = None) -> str:
+        """单个键的统一出口：硬件在线走 Arduino，硬件掉线/无映射则用软件补发。
+        key_name 为规范化键名（软件模块用），keycode 为 Arduino USB 键码（硬件用）。"""
+        resolved = self._effective_backend(backend)
+        if resolved == "arduino":
+            try:
+                if keycode is None:
+                    raise HardwareLostError(f"Arduino 键码表无 {key_name}")
+                self._arduino_press(keycode, duration_ms)
+                return f"arduino {key_name} for {int(duration_ms)}ms"
+            except HardwareLostError:
+                soft = self._software_fallback_name()
+                log(f"硬件不可用，{key_name} 改用软件模拟（{soft}）补发")
+                self._tap_key(key_name, duration_ms, backend=soft)
+                return f"{key_name} for {int(duration_ms)}ms via {soft}(hardware unavailable)"
+        self._tap_key(key_name, duration_ms, backend=resolved)
+        return f"pressed {key_name} for {int(duration_ms)}ms via {resolved}"
+
     def _paste_text(self, message: str, backend: str | None = None) -> None:
         clip = self._clipboard()
         clip.copy(message)
         time.sleep(0.05)
-        resolved = self._resolve_input_backend_name(backend)
+        resolved = self._effective_backend(backend)
         if resolved == "arduino":
-            self._arduino_hotkey(128, 118, 50)
+            try:
+                self._arduino_hotkey(128, 118, 50)
+            except HardwareLostError:
+                soft = self._software_fallback_name()
+                log(f"硬件不可用，Ctrl+V 改用软件模拟（{soft}）补发")
+                self._software_modifier_v(soft)
         elif sys.platform == "darwin":
-            self._hotkey("command", "v", backend=backend)
+            self._hotkey("command", "v", backend=resolved)
         else:
-            self._hotkey("ctrl", "v", backend=backend)
+            self._hotkey("ctrl", "v", backend=resolved)
         time.sleep(0.08)
 
     def _foreground_window(self) -> dict[str, Any] | None:
@@ -614,13 +1028,20 @@ class PcSkyController:
         return {**win_info, "focused": True, "foreground": self._foreground_window()}
 
     def ensure_game_foreground(self) -> dict[str, Any]:
-        # Arduino 硬件模式下可跳过前台检查
+        # Arduino 硬件模式下可跳过"抢焦点"，但**不跳过"校验"**（2026-11-01 修）：
+        # 曾经这里直接返回 focused=True/foreground=None，等于对外宣称"已在前台"，
+        # type_text 拿到这个结果就去 Ctrl+V，内容会粘进用户当时正在编辑的窗口。
         import os
         if os.environ.get("SKY_SKIP_FOCUS", "0") == "1":
             win_info = self.find_window()
-            if win_info:
-                return {**win_info, "focused": True, "foreground": None}
-            raise SkyError("Sky window not found. Start Sky first.")
+            if not win_info:
+                raise SkyError("Sky window not found. Start Sky first.")
+            if self._focus_strict() and not self._game_is_foreground():
+                raise SkyError("Sky window is not foreground: refusing to continue "
+                               "(SKY_SKIP_FOCUS=1 only means 'do not steal focus', it does not "
+                               "skip verification; set SKY_FOCUS_STRICT=0 for the old unsafe behaviour)"
+                               f". 当前前台窗口=「{self._fg_title()}」")
+            return {**win_info, "focused": True, "foreground": self._foreground_window()}
         win_info = self.find_window()
         if not win_info:
             raise SkyError("Sky window not found. Start Sky first, or pass --window-title.")
@@ -637,7 +1058,52 @@ class PcSkyController:
             raise SkyError(f"Sky window is not foreground. Foreground window is: {foreground.get('title')}")
         return {**win_info, "focused": True, "foreground": foreground}
 
-    def press_key(self, key: str, duration_ms: int = 80, backend: str | None = None) -> str:
+    # ---------------- 光翼硬门的 MCP 侧闸（2026-11-01）----------------
+    def set_wing_guard(self, active: bool) -> dict[str, Any]:
+        """记录 sky-loop 推送的光翼防护状态。
+
+        为什么要有这一层：光翼硬门原本只存在于 sky-loop 的 `_key()`，而 MCP 的
+        `press_key` 是对外暴露的底层按键接口 —— 任何绕过 loop 的调用方（外部脚本、
+        另一个会话、调试工具）都能直接按 F，等于硬门形同虚设。现在把状态机结果同步
+        到输入边界，由 MCP 自己拒绝 F，不依赖调用方自律。
+        """
+        with self._wing_guard_lock:
+            self._wing_guard_active = bool(active)
+            self._wing_guard_at = time.time()
+            active_now = self._wing_guard_active
+            at = self._wing_guard_at
+        log(f"wing guard <- {'ACTIVE (F blocked)' if active_now else 'clear'}")
+        return {"guard_active": active_now, "updated_at": at}
+
+    def wing_guard_state(self) -> dict[str, Any]:
+        with self._wing_guard_lock:
+            active = self._wing_guard_active
+            at = self._wing_guard_at
+        return {
+            "guard_active": active,
+            "age_sec": round(time.time() - at, 1) if at else None,
+        }
+
+    def _f_press_blocked(self, key: str, wing_pickup: bool = False) -> bool:
+        """MCP 层 F 闸：防护态下拒绝 F，只放行显式标注的自动拾取。
+
+        wing_pickup=True 只应由 sky-loop 的 wing_pickup_step 传入 —— 它背后还有
+        「账号有翼 + 明确开启」两把钥匙，属于有意拾取，不是误触。
+        """
+        if wing_pickup:
+            return False
+        if str(key).strip().lower() != "f":
+            return False
+        with self._wing_guard_lock:
+            return self._wing_guard_active
+
+    def press_key(self, key: str, duration_ms: int = 80, backend: str | None = None,
+                  wing_pickup: bool = False) -> str:
+        key = normalize_key(key)
+        if self._f_press_blocked(key, wing_pickup):
+            raise SkyError("wing guard active: refusing F "
+                           "(sky-loop reported wing_light nearby; only the double-key "
+                           "auto-pickup path may pass wing_pickup=true)")
         self.focus_game()
         # 严格前台校验：SKY_SKIP_FOCUS=1 只表示"不抢焦点"，不代表"可以打到别的窗口"。
         # Arduino 是真 USB 键盘，一旦前台不是光遇，这次按键会打进用户当前窗口。
@@ -645,29 +1111,194 @@ class PcSkyController:
             raise SkyError("Sky window is not foreground: refusing to press key "
                            "(set SKY_FOCUS_STRICT=0 to restore the unsafe behaviour)"
                            f". 当前前台窗口=「{self._fg_title()}」")
-        key = normalize_key(key)
-        resolved = self._resolve_input_backend_name(backend)
+        resolved = self._effective_backend(backend)
         if resolved == "gamepad":
             return self._gamepad_press(key, duration_ms)
-        if resolved == "arduino":
-            kc = self.ARDUINO_KEY_MAP.get(key)
-            if kc is None:
-                raise SkyError(f"No arduino mapping for key: {key}. Available: {list(self.ARDUINO_KEY_MAP.keys())}")
-            self._arduino_press(kc, duration_ms)
-            return f"arduino {key} for {int(duration_ms)}ms"
-        self._tap_key(key, duration_ms, backend=backend)
-        return f"pressed {key} for {int(duration_ms)}ms via {resolved}"
+        kc = self.ARDUINO_KEY_MAP.get(key)
+        return self._tap_with_fallback(key, kc, duration_ms, backend)
+
+    # ---------------- 弹琴（sky_song_player，CC BY-NC 署名 windhide）----------------
+    def _project_root(self) -> Path:
+        return Path(__file__).resolve().parent
+
+    def _song_dirs(self) -> list[str]:
+        """曲谱搜索目录（按优先级，去重，只保留真实存在的）：
+        1) songs/                  项目曲谱目录（本地可放整库；Git 只随仓库分发少量自制/公有领域示例）
+        2) user_data/songs/        用户自备曲谱（gitignore，不进 Git）
+        3) SKY_SONGS_DIR 环境变量   分号分隔的额外目录
+        4) 本机已安装的星星弹琴软件曲库（若存在，零配置直读，不随仓库分发）
+
+        跨目录由 list_song_files 按歌名去重，项目 songs/ 优先，重复曲谱不会重复计数。
+        """
+        root = self._project_root()
+        candidates = [
+            root / "songs",
+            root / "user_data" / "songs",
+        ]
+        for part in os.environ.get("SKY_SONGS_DIR", "").split(os.pathsep):
+            part = part.strip()
+            if part:
+                candidates.append(Path(part))
+        home = Path.home()
+        for rel in (
+            r"Desktop\systemMusic",
+            r"Desktop\sky-music\Sky_Music\resources\systemMusic",
+            r"Desktop\sky-music\Sky_Music\resources\myImport",
+        ):
+            candidates.append(home / rel)
+        dirs: list[str] = []
+        seen: set[str] = set()
+        for c in candidates:
+            sp = str(c)
+            if sp not in seen and c.is_dir():
+                seen.add(sp)
+                dirs.append(sp)
+        return dirs
+
+    def list_songs(self, limit: int = 300) -> dict[str, Any]:
+        if sky_song_player is None:
+            raise SkyError(f"弹琴模块加载失败：{_SONG_IMPORT_ERROR}")
+        dirs = self._song_dirs()
+        songs = sky_song_player.list_song_files(dirs)
+        view = [{"name": s["name"], "size": s["size"], "dir": s["dir"]}
+                for s in songs[:max(0, limit)]]
+        return {"total": len(songs), "showing": len(view), "dirs": dirs, "songs": view}
+
+    def _get_song_player(self):
+        if sky_song_player is None:
+            raise SkyError(f"弹琴模块加载失败：{_SONG_IMPORT_ERROR}")
+        if self._song_player is None:
+            self._song_player = sky_song_player.SongPlayer(
+                chord_fn=lambda keys, hold_ms: self.press_chord(
+                    keys, hold_ms, backend=getattr(self, "_song_backend", None)),
+            )
+        return self._song_player
+
+    def play_song(self, name: str, speed: float = 1.0, auto_focus: bool = True,
+                  backend: str | None = None, choice: str | None = None,
+                  humanize: int = 0, instrument: str | None = None,
+                  dry_run: bool = False) -> dict[str, Any]:
+        """弹一首曲谱。
+
+        choice：同名多版本时的选择（"1"/"第2个"/"烛子" 等，见 sky_song_player.resolve_choice）。
+        命中多个且没给 choice 时返回 multiple_matches（带候选清单），由调用方去问玩家。
+        humanize：0 关闭（默认）/ 1 轻微 / 2 明显（音符微抖动 + 句间呼吸）。
+        instrument：piano/violin/flute/harmonica；不传则用本地设置（默认 piano）。
+        """
+        if not isinstance(name, str) or not name.strip():
+            raise SkyError("play_song 需要指定歌名 name")
+        player = self._get_song_player()
+        self._song_backend = backend
+        dirs = self._song_dirs()
+        # 先看这首歌到底有几个**不同**版本（重复上传的同一份已合并）：
+        # ≥2 个就一定要问玩家要哪个 —— 精确名命中也不例外。曲库里同名谱常常同时
+        # 存在裸版/署名版/变奏版，替玩家随便挑一个正是 2026-10-28 要修的"随机拿版本"。
+        cands = sky_song_player.find_song_versions(name, dirs)
+        view = [{"index": c["index"], "label": c["label"], "name": c["name"],
+                 "total_ms": c["total_ms"], "duration": c.get("duration", ""),
+                 "is_community": c["is_community"],
+                 "transcribed_by": c.get("transcribed_by", "")} for c in cands]
+        if not cands:
+            # 兜底：分组万一漏掉，退回单曲查找，别让玩家"明明有谱却说找不到"
+            _fb = sky_song_player.find_song(name, dirs)
+            if _fb is None:
+                # 近似候选：让调用方（AI）知道"最像的是哪几首"，好反问玩家而不是
+                # 干等 / 硬说自己弹了。2026-11-12 真机：not_found 连发 7 次、
+                # AI 拿不到原因，一直说"在弹啦"。
+                _sugg: list[dict] = []
+                try:
+                    _sugg = sky_song_player.find_song_similar(name, dirs, limit=5)
+                except Exception as _e:  # 老版本模块没有该函数时不影响 not_found 主体
+                    log(f"[Song] 近似候选查询失败（忽略）：{_e}")
+                _sugg_names = [s["name"] for s in _sugg]
+                _msg = "没有找到该曲谱（用 list_songs 查看可用曲目）"
+                if _sugg_names:
+                    _msg = ("没有叫「%s」的谱。曲库里最接近的是：%s"
+                            % (name.strip(), "、".join("《%s》" % s for s in _sugg_names)))
+                return {"ok": False, "reason": "not_found",
+                        "message": _msg,
+                        "suggestions": _sugg_names,
+                        "searched_dirs": dirs}
+            match = {"file": _fb["file"], "name": _fb["name"]}
+        elif len(cands) > 1:
+            if choice:
+                picked = sky_song_player.resolve_choice(cands, choice)
+                if picked is None:
+                    return {"ok": False, "reason": "bad_choice",
+                            "message": f"没听懂要选哪个版本，回复 1~{len(cands)} 的序号或版本名",
+                            "song_query": name.strip(), "matches": view}
+                match = {"file": picked["file"], "name": picked["name"]}
+                print(f"  [Song] 玩家选了第{picked['index']}个版本：{picked['name']}")
+            else:
+                return {"ok": False, "reason": "multiple_matches",
+                        "message": f"「{name.strip()}」有 {len(cands)} 个不同版本，需要玩家选一个",
+                        "song_query": name.strip(), "matches": view}
+        else:
+            match = {"file": cands[0]["file"], "name": cands[0]["name"]}
+        try:
+            sheet = sky_song_player.load_sheet(match["file"])
+        except ValueError as e:
+            return {"ok": False, "reason": "bad_sheet", "message": str(e)}
+        if dry_run:
+            # 只解析不演奏，也不抢焦点：调用方先知道"有几个版本/能不能弹"，
+            # 避免为了问一句版本就把乐器界面按开（开了再按 C 发问句会把界面关掉）
+            return {"ok": True, "dry_run": True, "song": sheet["name"],
+                    "author": sheet.get("author", ""),
+                    "transcribed_by": sheet.get("transcribed_by", ""),
+                    "events": len(sheet["events"]), "total_ms": sheet["total_ms"]}
+        if auto_focus:
+            self.focus_game()
+        if self._focus_strict() and not self._game_is_foreground():
+            raise SkyError("Sky window is not foreground: refusing to play song "
+                           "(set SKY_FOCUS_STRICT=0 to restore the unsafe behaviour)"
+                           f". 当前前台窗口=「{self._fg_title()}」")
+        # 乐器档位：钢琴按住不延音，管弦/吹奏可以拉长（决定每个音的保持时长）。
+        # 优先用调用方传的 instrument，否则读本地设置（user_data/song_settings.json，玩家自己填）。
+        _kind = str(instrument or "").strip().lower()
+        if _kind not in sky_song_player.INSTRUMENT_PROFILES:
+            try:
+                from core.song_settings import kind_of as _kind_of
+                _kind = _kind_of()
+            except Exception:
+                _kind = "piano"
+        _prof = sky_song_player.instrument_profile(_kind)
+        _hum = int(humanize or 0)
+        player.play(sheet, speed=float(speed or 1.0), humanize=_hum,
+                    sustain=bool(_prof["sustain"]), max_hold_ms=int(_prof["max_hold_ms"]))
+        st = player.state()
+        return {"ok": True, "message": f"开始弹奏：{sheet['name']}", "song": sheet["name"],
+                "author": sheet.get("author", ""), "transcribed_by": sheet.get("transcribed_by", ""),
+                "events": len(sheet["events"]), "total_ms": sheet["total_ms"],
+                "backend": self._effective_backend(backend),
+                "instrument": _prof["label"], "humanize": _hum,
+                "status": st["status"], "progress_pct": st["progress_pct"], "speed": st["speed"]}
+
+    def stop_song(self) -> dict[str, Any]:
+        if self._song_player is None:
+            return {"ok": True, "status": "idle", "message": "当前没有在弹奏"}
+        self._song_player.stop()
+        return {"ok": True, "status": "stopped", "message": "已停止弹奏"}
+
+    def song_status(self) -> dict[str, Any]:
+        if self._song_player is None:
+            return {"status": "idle"}
+        return self._song_player.state()
+
+    def _stop_song_on_exit(self) -> None:
+        try:
+            if self._song_player is not None:
+                self._song_player.stop()
+        except Exception:
+            pass
 
     def open_chat(self, key: str = "enter", duration_ms: int = 35, backend: str | None = None) -> str:
         self.focus_game()
         key = normalize_key(key)
-        resolved = self._resolve_input_backend_name(backend)
-        if resolved == "arduino":
-            kc = self.ARDUINO_KEY_MAP.get(key, 176)
-            self._arduino_press(kc, duration_ms)
-            return f"arduino tapped {key} for {int(duration_ms)}ms"
-        self._tap_key(key, duration_ms, backend=backend)
-        return f"tapped {key} for {int(duration_ms)}ms via {resolved}"
+        resolved = self._effective_backend(backend)
+        if resolved == "gamepad":
+            return self._gamepad_press(key, duration_ms)
+        kc = self.ARDUINO_KEY_MAP.get(key, 176)
+        return self._tap_with_fallback(key, kc, duration_ms, backend).replace("pressed", "tapped")
 
     def type_text(
         self,
@@ -684,15 +1315,17 @@ class PcSkyController:
 
         if require_foreground:
             self.ensure_game_foreground()
+        # 粘贴前再查一次前台（2026-11-01 修）：ensure 与 Ctrl+V 之间存在竞态，且历史版本
+        # 在 SKY_SKIP_FOCUS=1 时会返回"伪成功"。send_chat 早就有这道检查，type_text 漏了。
+        if self._focus_strict() and not self._game_is_foreground():
+            raise SkyError("Sky window is not foreground: refusing to type "
+                           "(Ctrl+V would paste into another window; SKY_FOCUS_STRICT=0 to override)"
+                           f". 当前前台窗口=「{self._fg_title()}」")
         self._paste_text(message, backend=backend)
         if send:
-            resolved = self._resolve_input_backend_name(backend)
-            if resolved == "arduino":
-                self._arduino_press(176, enter_tap_ms)
-            else:
-                self._tap_key("enter", enter_tap_ms, backend=backend)
+            self._tap_with_fallback("enter", 176, enter_tap_ms, backend)
         action = "sent" if send else "typed"
-        return f"{action} text: {message} via {self._resolve_input_backend_name(backend)}"
+        return f"{action} text: {message} via {self._effective_backend(backend)}"
 
     def send_chat(
         self,
@@ -713,12 +1346,13 @@ class PcSkyController:
             self.ensure_game_foreground()
         else:
             self.focus_game(force=True)
-            resolved = self._resolve_input_backend_name(backend)
-            if resolved == "arduino":
-                kc = self.ARDUINO_KEY_MAP.get(normalize_key(open_key), 176)
-                self._arduino_press(kc, enter_tap_ms)
+            resolved = self._effective_backend(backend)
+            open_norm = normalize_key(open_key)
+            if resolved == "gamepad":
+                self._gamepad_press(open_norm, enter_tap_ms)
             else:
-                self._tap_key(open_key, enter_tap_ms, backend=backend)
+                kc = self.ARDUINO_KEY_MAP.get(open_norm, 176)
+                self._tap_with_fallback(open_norm, kc, enter_tap_ms, backend)
             time.sleep(max(0, open_delay_ms) / 1000)
         # 前台不是光遇时，下面的 Ctrl+V 会把聊天内容粘进用户正在编辑的窗口
         if self._focus_strict() and not self._game_is_foreground():
@@ -727,13 +1361,13 @@ class PcSkyController:
                            f". 当前前台窗口=「{self._fg_title()}」")
         self._paste_text(message, backend=backend)
         if send:
-            resolved_send = self._resolve_input_backend_name(backend)
-            if resolved_send == "arduino":
-                self._arduino_press(176, enter_tap_ms)
+            resolved_send = self._effective_backend(backend)
+            if resolved_send == "gamepad":
+                self._gamepad_press("enter", enter_tap_ms)
             else:
-                self._tap_key("enter", enter_tap_ms, backend=backend)
+                self._tap_with_fallback("enter", 176, enter_tap_ms, backend)
         action = "sent" if send else "typed"
-        return f"{action} chat: {message} via {self._resolve_input_backend_name(backend)}"
+        return f"{action} chat: {message} via {self._effective_backend(backend)}"
 
     def _limit_image_size(self, image):
         max_width = max(1, int(self.config.screenshot_max_width))
@@ -962,8 +1596,21 @@ TOOLS = [
                 "key": {"type": "string", "description": "Key name such as w, a, s, d, space, f, q, e, tab, enter, or shift-space."},
                 "duration_ms": {"type": "integer", "description": "Hold duration in milliseconds.", "default": 80},
                 "backend": {"type": "string", "description": "Input backend override: auto, pydirectinput, pyautogui, gamepad, or arduino.", "default": "auto"},
+                "wing_pickup": {"type": "boolean",
+                                "description": "Only for the deliberate wing-light auto-pickup path (double-key enabled). Bypasses the wing guard; never set this to press F around a wing light.", "default": False},
             },
             "required": ["key"],
+        },
+    },
+    {
+        "name": "set_wing_guard",
+        "description": "Report whether wing_light is currently nearby. While active, this server refuses every press_key('f') except wing_pickup=true, so external callers cannot bypass the wingless-account protection.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "active": {"type": "boolean", "description": "True = wing_light detected nearby; F must be blocked."},
+            },
+            "required": ["active"],
         },
     },
     {
@@ -1020,6 +1667,63 @@ TOOLS = [
         "description": "Take a screenshot of the Sky window and return it as a PNG image.",
         "inputSchema": {"type": "object", "properties": {}},
     },
+    {
+        "name": "list_songs",
+        "description": "List available Sky sheet-music songs (.txt in Sky Music Studio format) "
+                       "from the built-in songs/ folder, user_data/songs/, SKY_SONGS_DIR, and an "
+                       "auto-detected SkyMusicPlay library. Use to know which songs can be played.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "limit": {"type": "integer", "description": "Max songs to return (default 300).",
+                          "default": 300},
+            },
+        },
+    },
+    {
+        "name": "play_song",
+        "description": "Play a Sky sheet-music song on the in-game instrument (15-key keyboard). "
+                       "Runs asynchronously in a background thread; keys are sent through the same "
+                       "hardware-first/software-fallback input backend. Requires the instrument to be "
+                       "already open in game. The name is matched exactly then by substring.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Song name or part of it, e.g. 斑马斑马."},
+                "speed": {"type": "number", "description": "Playback speed multiplier, 0.2-4 (default 1).",
+                          "default": 1.0},
+                "auto_focus": {"type": "boolean", "description": "Bring Sky to foreground first (default true).",
+                               "default": True},
+                "backend": {"type": "string", "description": "Input backend override: auto, pydirectinput, "
+                                                             "pyautogui, or arduino.", "default": "auto"},
+                "choice": {"type": "string", "description": "Which version to play when the name matches "
+                                                            "several sheets: an ordinal ('1', '第2个') or a "
+                                                            "keyword from the version label (e.g. 烛子)."},
+                "humanize": {"type": "integer", "description": "0 = exact (default), 1 = slight jitter + "
+                                                              "phrase breaths, 2 = stronger (slow songs).",
+                             "default": 0},
+                "instrument": {"type": "string", "description": "piano / violin / flute / harmonica. "
+                                                               "Controls whether notes may be held (piano cannot "
+                                                               "sustain). Defaults to the local song setting.",
+                               "default": ""},
+                "dry_run": {"type": "boolean", "description": "Resolve the sheet and versions only; do not focus the "
+                                                              "game and do not play. Used to ask the player which "
+                                                              "version before opening the instrument UI.",
+                            "default": False},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "stop_song",
+        "description": "Stop the currently playing sheet-music song immediately.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "song_status",
+        "description": "Get the current song playback status, progress, and errors.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
 ]
 
 
@@ -1034,11 +1738,16 @@ class McpServer:
             return {"content": text_content(json.dumps(
                 self.controller.focus_game(force=bool(arguments.get("force", False))),
                 ensure_ascii=False, indent=2))}
+        if name == "set_wing_guard":
+            return {"content": text_content(json.dumps(
+                self.controller.set_wing_guard(bool(arguments.get("active", False))),
+                ensure_ascii=False))}
         if name == "press_key":
             result = self.controller.press_key(
                 arguments["key"],
                 arguments.get("duration_ms", 80),
                 arguments.get("backend"),
+                arguments.get("wing_pickup", False),
             )
             return {"content": text_content(result)}
         if name == "open_chat":
@@ -1082,6 +1791,29 @@ class McpServer:
         if name == "take_screenshot":
             data = self.controller.screenshot_base64()
             return {"content": [{"type": "image", "data": data, "mimeType": "image/png"}]}
+
+        if name == "list_songs":
+            return {"content": text_content(json.dumps(
+                self.controller.list_songs(arguments.get("limit", 300)),
+                ensure_ascii=False, indent=2))}
+        if name == "play_song":
+            return {"content": text_content(json.dumps(
+                self.controller.play_song(
+                    arguments["name"],
+                    arguments.get("speed", 1.0),
+                    arguments.get("auto_focus", True),
+                    arguments.get("backend"),
+                    arguments.get("choice"),
+                    arguments.get("humanize", 0),
+                    arguments.get("instrument") or None,
+                    arguments.get("dry_run", False),
+                ), ensure_ascii=False, indent=2))}
+        if name == "stop_song":
+            return {"content": text_content(json.dumps(
+                self.controller.stop_song(), ensure_ascii=False, indent=2))}
+        if name == "song_status":
+            return {"content": text_content(json.dumps(
+                self.controller.song_status(), ensure_ascii=False, indent=2))}
         raise SkyError(f"Unknown tool: {name}")
 
     def handle(self, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -1151,15 +1883,44 @@ def require_authorized(handler: BaseHTTPRequestHandler, config: ServerConfig) ->
     return False
 
 
+def _server_already_listening(port: int, host: str = "127.0.0.1", timeout: float = 0.5) -> bool:
+    """探测本机端口是否已有 MCP 在监听（能连上即说明有实例）。
+
+    防止重复启动：Windows 下 ThreadingHTTPServer 的 SO_REUSEADDR 会让两个进程都成功绑定
+    同一端口，随后入站请求被随机分发，而只有一个进程真正占着硬件，表现为动作时好时坏。
+    """
+    probe_host = "127.0.0.1" if host in ("0.0.0.0", "", "::") else host
+    try:
+        fam = socket.AF_INET6 if ":" in probe_host else socket.AF_INET
+    except Exception:
+        fam = socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        return s.connect_ex((probe_host, port)) == 0
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def run_http(server: McpServer, config: ServerConfig) -> None:
     if config.host not in LOCAL_HOSTS and not config.token:
         raise SystemExit("Refusing to bind a remote HTTP server without --token.")
+    if _server_already_listening(config.port, config.host):
+        raise SystemExit(
+            f"端口 {config.port} 上已有 MCP 实例在运行（可能是旧窗口没关、或重复启动）。\n"
+            "本实例主动退出，避免两个 MCP 同时抢硬件/分流请求。请先关掉旧的 MCP 窗口再启动。"
+        )
     server.controller._detect_ocr_name()
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path != "/health":
                 self.send_error(404)
+                return
+            # 2026-11-01 P0：/health 也要鉴权（以前不鉴权，任何本机进程都能探到服务信息）
+            if not require_authorized(self, config):
                 return
             body = json.dumps({
                 "status": "ok",
@@ -1225,6 +1986,35 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def _resolve_mcp_token(config: ServerConfig) -> str:
+    """HTTP 鉴权 token 的解析顺序（2026-11-01 P0：不再用写死的 1234）：
+    --token / SKY_MCP_TOKEN → user_data/mcp_token.txt（首次启动自动生成）。
+    sky-loop 读同一文件，所以两边天然一致；token 只落本地、不进仓库。"""
+    tok = (config.token or "").strip()
+    if tok:
+        return tok
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "user_data", "mcp_token.txt")
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            tok = f.read().strip()
+        if tok:
+            return tok
+    except OSError:
+        pass
+    tok = secrets.token_urlsafe(24)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(tok)
+        os.replace(tmp, path)
+        log("generated random MCP token -> user_data/mcp_token.txt (loop reads same file)")
+    except OSError as e:
+        log(f"WARN: cannot persist MCP token ({e}); token is memory-only this run")
+    return tok
+
+
 def main() -> None:
     args = parse_args()
     # 注册退出清理：释放所有修饰键，防止键盘卡住
@@ -1245,7 +2035,11 @@ def main() -> None:
         screenshot_max_height=args.screenshot_max_height,
         serial_port=args.serial_port,
     )
+    config.token = _resolve_mcp_token(config)
     controller = PcSkyController(config)
+    # 启动硬件热插拔守护：插上板子自动用硬件，没插/拔出自动退回软件模拟，
+    # 每 30 秒检测、插回自动切回。显式选软件/手柄后端时不启动。
+    controller.start_hardware_monitor()
     server = McpServer(controller)
     if args.http:
         run_http(server, config)

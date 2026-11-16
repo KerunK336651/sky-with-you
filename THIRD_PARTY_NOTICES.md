@@ -11,6 +11,27 @@
 | [akini a0315/sky-with-you](https://github.com/akini%20a0315/sky-with-you) | 原始项目框架、整体结构、README 基础 | MIT |
 | [112Alan/sky-companion](https://github.com/112Alan/sky-companion) | 聊天引擎、长期记忆、回复处理、风格学习、联网搜索（`core/` 移植自其 `user_settings.py`、`ocr_agent.py`） | MIT |
 | [Aevella/sky-pc-mcp-companion](https://github.com/Aevella/sky-pc-mcp-companion) | 执行层 MCP server 与键盘注入（`sky-mcp-server.py`） | MIT |
+| [windhide/SkyMusicPlay-for-Windows](https://github.com/windhide/SkyMusicPlay-for-Windows) | **弹琴功能**：曲谱格式解析、15 键键位、和弦聚合、播放时序（`sky_song_player.py`）；已获作者书面授权 | **CC BY-NC 4.0**（见下） |
+
+## 弹琴功能：windhide 项目（CC BY-NC 4.0，已获书面授权）
+
+本项目的弹琴功能（`sky_song_player.py` 中曲谱解析、键位映射、和弦聚合与播放时序）
+改编自 windhide 的「星星弹琴软件」。已通过作者所在用户群的临时会话取得其本人同意，
+授权原话为 **"可以照搬标记出处就可以"**（聊天截图见
+[`docs/credits/`](docs/credits/)）。
+
+- 上游：https://github.com/windhide/SkyMusicPlay-for-Windows
+- 作者：windhide
+- 许可：**Creative Commons 署名-非商业性使用 4.0 国际（CC BY-NC 4.0）**
+- 该部分代码**单独声明为 CC BY-NC 4.0**（文件头已标注来源/作者/链接/许可），与本项目
+  其余自有代码的 GPL-3.0 相互独立；**不得用于商业用途**，转载或改编须署名 windhide。
+- 本项目**未照搬**上游的 `PostMessageW` 后台发键实现，实际发键由本项目自有统一按键后端
+  （Arduino 真 USB HID 优先 / pydirectinput 软件兜底）完成。
+- **曲谱不随仓库分发**：本地曲库里的 `.txt` 多为社区用户转录，版权归原曲作者与转录者
+  所有；作者授权软件并不等于授权分发每首曲谱。仓库仅在 `songs/` 提供少量自制/公有领域
+  示例，其余曲谱请自行获取并放入 `user_data/songs/` 或用 `SKY_SONGS_DIR` 指定。
+
+CC BY-NC 4.0 许可全文：https://creativecommons.org/licenses/by-nc/4.0/
 
 ## MIT 许可证声明
 

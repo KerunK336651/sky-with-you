@@ -47,6 +47,8 @@ SAFE = [
     "test_run_loop.py",         # 看护进程：崩溃码判据/决策表/记忆文件（端到端只起立刻退出的小子进程）
     "test_evidence.py",         # 取证帧命名与清理：按 mtime 保留，钉住「写一张删一张」回归
     "test_reopen_action.py",    # 动作后主动重开面板：场景/弹窗/好友树/冷却 门控（打桩）
+    "test_interaction_dedup.py",  # 近期互动记忆 + 防重复发起（重复抱抱修复）
+    "test_song_player.py",       # 弹琴：曲谱解析/和弦聚合/播放线程/倍速/暂停停止（mock 发键）
     "test_ocr_enhance.py",      # OCR 增强（会跑真实 OCR，最慢，放最后）
 ]
 

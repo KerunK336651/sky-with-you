@@ -57,9 +57,47 @@ def build_attribution(pt_path: str, release: str) -> dict:
     return attr
 
 
-def stamp(pt_path: str, release: str) -> None:
+def check_pt_safe(pt_path: str, anywhere: bool = False) -> str | None:
+    """最小安全守卫（2026-11-13 加）。返回 None 表示可继续，否则返回拒绝原因。
+
+    为什么需要它：`torch.load(..., weights_only=False)` 会**执行 pickle 里的任意可调用对象**
+    （ultralytics 的 .pt 是含模型类的 dict，确实必须 False）。这与"把 .pt 交给陌生人"没有区别，
+    所以至少要拦住"明显不是权重的东西"和"手滑指向了别的目录的文件"：
+      1) 后缀必须是 .pt；
+      2) 头部必须是 torch 的 zip 容器（`PK\x03\x04`）；老式 pickle（`\x80\x02`）放行但提示；
+      3) 默认只允许项目目录内（`--anywhere` 可显式放开）。
+    真正的信任边界是"这个文件从哪来"，本函数只防呆，不防恶意。
+    """
+    if not os.path.isfile(pt_path):
+        return "文件不存在"
+    if not pt_path.lower().endswith(".pt"):
+        return "不是 .pt 文件"
+    try:
+        with open(pt_path, "rb") as f:
+            head = f.read(4)
+    except OSError as e:
+        return "读不了：%s" % e
+    if head[:4] != b"PK\x03\x04":
+        if head[:2] == b"\x80\x02":
+            print(f"[警告] {os.path.basename(pt_path)} 是老式 pickle 格式，"
+                  f"weights_only=False 会执行其中的代码，请确认来源可信")
+        else:
+            return "头部不是 torch/zip 容器（%r），拒绝加载" % head
+    if not anywhere:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        real = os.path.realpath(pt_path)
+        if os.path.commonpath([os.path.realpath(root), real]) != os.path.realpath(root):
+            return "路径不在项目目录内；确认可信请加 --anywhere"
+    return None
+
+
+def stamp(pt_path: str, release: str, anywhere: bool = False) -> None:
     if not os.path.isfile(pt_path):
         print(f"[跳过] 找不到文件: {pt_path}")
+        return
+    why = check_pt_safe(pt_path, anywhere=anywhere)
+    if why:
+        print(f"[拒绝] {pt_path}：{why}")
         return
     # ultralytics 保存的 .pt 是含模型类的 dict，必须 weights_only=False
     ckpt = torch.load(pt_path, map_location="cpu", weights_only=False)
@@ -90,9 +128,11 @@ def main():
     ap = argparse.ArgumentParser(description="给 YOLO 权重嵌入作者署名（软水印）")
     ap.add_argument("weights", nargs="+", help="一个或多个 .pt 路径")
     ap.add_argument("--release", default="v1.0", help="发布版本标签，默认 v1.0")
+    ap.add_argument("--anywhere", action="store_true",
+                    help="允许处理项目目录之外的路径（默认只允许项目内）")
     args = ap.parse_args()
     for p in args.weights:
-        stamp(p, args.release)
+        stamp(p, args.release, anywhere=args.anywhere)
     print("\n已处理。下一步：重算 SHA256（py tools/hash_models.py 或手工 Get-FileHash）再发布。")
 
 

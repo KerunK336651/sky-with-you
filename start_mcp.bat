@@ -17,7 +17,7 @@ echo [2/2] Starting MCP server...
 set SKY_SKIP_FOCUS=1
 rem Auto-detect Arduino by USB ID; uncomment to force a port:
 rem set SKY_SERIAL_PORT=COM4
-py sky-mcp-server.py --http --port 9900 --token 1234 --input-backend arduino 2>&1
+py sky-mcp-server.py --http --port 9900 --input-backend arduino 2>&1
 echo.
 echo [MCP server exited with code %ERRORLEVEL%]
 pause

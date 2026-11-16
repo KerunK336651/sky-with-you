@@ -211,7 +211,7 @@ def make_state():
         style_checked=True, style_knowledge={},          # True：跳过会联网的风格学习
         is_holding_hands=False, pose_state="standing",
         pose_need_retry=False, pose_last_target="", gohome_completed=False,
-        pending_invites={})
+        pending_invites={}, recent_interactions=[])
 
 
 def run_ai_loop(script, msgs_list, vision, expect_items=1, extra_wait=0.4):
@@ -391,5 +391,15 @@ expect("没有 ACT 标签 -> 空列表", A("[CHAT]只是聊天[/CHAT]") == [])
 expect("畸形半截标签不匹配", A("[ACT]回遇境") == [] and A("回遇境[/ACT]") == [])
 expect("标签内是空白 -> 产出空串（调用方按名字比对，不会误判）",
        A("[ACT]   [/ACT]") == [""])
+
+# ---- [ACT!] 强制标记：AI 知道刚做过、仍有意再做一次（绕过重复发起兜底）----
+F = M.extract_force_acts
+expect("[ACT!] 动作名照常取出", A("[ACT!]抱抱[/ACT]") == ["抱抱"])
+expect("[ACT!] 进入强制集合", F("[ACT!]抱抱[/ACT]") == {"抱抱"})
+expect("普通 [ACT] 不进强制集合", F("[ACT]抱抱[/ACT]") == set())
+expect("强制与普通混合：只强制的进集合",
+       F("[ACT]摸头[/ACT][ACT!]抱抱[/ACT]") == {"抱抱"})
+expect("[ACT!] 带空格也能判出",
+       A("[ACT!] 抱抱 [/ACT]") == ["抱抱"] and F("[ACT!] 抱抱 [/ACT]") == {"抱抱"})
 
 print("\n全部通过")

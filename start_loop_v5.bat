@@ -5,7 +5,7 @@ echo ========================================
 echo   Sky Loop v7.1  PP-OCRv5
 echo   Chat engine: sky-companion port
 echo   Input backend: Arduino (auto port)
-echo   Supervised: on crash -> auto fallback to CPU OCR
+echo   Supervised: on crash -^> auto fallback to CPU OCR
 echo ========================================
 echo.
 
@@ -18,7 +18,22 @@ set SKY_OCR_MODEL=v5
 set SKY_OCR_DEVICE=auto
 set SKY_SEARCH_ENABLED=1
 set SKY_WHITELIST_ENABLED=1
+rem Wing auto-pickup (default OFF): keep OFF for wingless accounts (irreversible);
+rem for winged accounts, uncomment the line below to enable auto pickup.
+rem set SKY_AUTO_PICKUP_WING=1
 set SKY_WHITELIST=珂珂,幺幺,阿颜
+
+rem ===== 弹琴（2026-11-01）：快捷栏/乐器在 setup_song.bat 里填，这里只管播放行为 =====
+rem 拟人化：0=精确按谱（默认）1=轻微抖动+句间呼吸 2=明显（适合慢曲）
+set SKY_SONG_HUMANIZE=0
+rem 停止信号：每 2s 扫一次，连续 2 拍确认才停（约 4s）；改成 1 就是一拍立刻停
+rem set SKY_SONG_STOP_CONFIRM=2
+rem set SKY_SONG_STOP_SCAN=2.0
+rem 乐器界面确认等待（秒）：真机认不出 instrument 就调大到 8
+rem set SKY_INSTRUMENT_WAIT=4.0
+rem 停止词留空则只认界面词：set SKY_SONG_STOP_WORDS=
+rem 互动邀请：默认 0=只观测不按 F；确认稳定后再改 1（或菜单 [9]）
+rem set SKY_ACCEPT_AUTO=0
 
 echo Current config:
 echo   LLM: %SKY_LLM_PROVIDER% / %SKY_LLM_MODEL%

@@ -10,7 +10,7 @@ echo.
 echo 注意: 光遇PC版可能屏蔽软件模拟按键
 echo 但 OCR/LLM/记忆/搜索 等聊天引擎逻辑正常
 echo.
-py sky-mcp-server.py --http --port 9900 --token 1234 --input-backend pydirectinput
+py sky-mcp-server.py --http --port 9900 --input-backend pydirectinput
 echo.
 echo [MCP exited with code %ERRORLEVEL%]
 pause

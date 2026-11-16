@@ -6,12 +6,12 @@
 
 和命令行版 collect_interactions.py 功能一致，但有图形界面：
   - 左侧实时预览：直接看到当前抓到的游戏画面，确认要截的内容；
-  - 右侧分类别（4 页）：每个按钮显示「中文名 + 英文类名 + 已采张数」，选中高亮，
+  - 右侧类别按钮：每个按钮显示「中文名 + 英文类名 + 已采张数」，选中高亮，
     鼠标可点，也可以继续用键盘（游戏全屏时只能用键盘 + 提示音）。
 
 切换 / 截图按键（游戏里按即可，不拦截游戏本身的按键）：
-  小键盘 1-9 = 选当前页里的第 N 个类；小键盘 0 = 快速切「通用负样本」（需开 NumLock）
-  F6 = 翻到下一页；F8 = 下一个类（跨页）；F7 = 上一个类
+  小键盘 1-4 = 选当前页的类（需开 NumLock）；小键盘 0 = 快速切负样本
+  F6 = 翻到下一页（本轮 2 页）；F8 = 下一个类；F7 = 上一个类
   F9 = 截当前类 1 张（画面没变化会被跳过）
   F10 = 开/关连拍（每 1.5s 一张，期间务必走动/转镜头换画面）
   F12 = 退出，并打印每类数量
@@ -56,52 +56,126 @@ PREVIEW_MS = 60            # 界面实时预览刷新间隔（约 16fps）
 POLL_MS = 30               # 键盘事件轮询间隔
 
 # ── 类别分页（英文类名, 中文名）─────────────────────────────────────────
-# 第 1、2 页是双人互动邀请（含 v6 新增 10 个动作 + 互火）；
-# 第 3 页是界面/功能图标；第 4 页是负样本（标注时不画框，作为困难背景）。
+# 2026-10-31 按《补采清单_20261031.md》重排为 4 页：
+#   第1页：本轮新增 6 个正类（v7 已有 116~233 张，继续补多样性）
+#   第2页：P0 老类补采 A（9 类，真机反馈识别低或样本偏少）
+#   第3页：P0/P1 老类补采 B（8 类）
+#   第4页：negative 困难负样本（小键盘 0 也可快速切到）
 PAGES = [
-    [  # 第 1 页 · 双人互动（上）
-        ("hug", "抱抱"),
-        ("carry", "背背"),
-        ("high_five", "击掌"),
-        ("fist_bump", "碰拳"),
-        ("hand", "牵手"),
-        ("head_pat", "摸摸头"),
-        ("play_fight", "打闹"),
-        ("bear_hug", "熊抱"),
-        ("princess_carry", "公主抱"),
+    [  # 第 1 页 · 新增正类
+        ("instrument", "乐器界面"),
+        ("settings_menu", "设置菜单"),
+        ("butterfly_lure", "引蝶"),
+        ("action_cancel", "持续动作取消"),
+        ("princess_hug", "公主抱"),
+        ("duo_dance", "双人舞"),
     ],
-    [  # 第 2 页 · 双人互动（下）
-        ("spin_dance", "双人旋转共舞"),
-        ("shoulder", "搭肩"),
-        ("curtain_call", "谢幕"),
-        ("whisper", "耳语"),
-        ("fancy_high_five", "默契花式击掌"),
-        ("handshake", "握手"),
-        ("mutual_light", "互火·点亮"),
-    ],
-    [  # 第 3 页 · 界面/功能图标
-        ("chat_input", "聊天框"),
-        ("open_tree", "好友树四角星"),
+    [  # 第 2 页 · P0 老类补采 A
+        ("accept_hug", "抱抱"),
+        ("accept_high_five", "击掌"),
         ("follow", "跟随"),
-        ("light", "举蜡烛点火"),
-        ("focus", "眼睛聚焦"),
-        ("seat", "打坐图标"),
-        ("wing_light", "光翼·只远截"),
-        ("teleport", "传送确认"),
+        ("focus", "聚焦"),
+        ("seat", "打坐"),
+        ("mutual_light", "互火"),
+        ("hand_icon", "牵手"),
+        ("bear_hug", "熊抱"),
+        ("wing_light", "光翼"),
     ],
-    [  # 第 4 页 · 负样本（标注时都是背景）
-        ("negative", "通用负样本"),
-        ("replay", "留影·负样本"),
-        ("paper_boat", "纸船·负样本"),
-        ("music_note", "音符·负样本"),
-        ("outfit", "换装·负样本"),
+    [  # 第 3 页 · P0/P1 老类补采 B
+        ("curtain_call", "谢幕"),
+        ("fancy_high_five", "花式击掌"),
+        ("head_pat", "摸头"),
+        ("play_fight", "打闹"),
+        ("spin_dance", "共舞"),
+        ("accept_fist_bump", "碰拳"),
+        ("light", "点火"),
+        ("handshake", "握手"),
+    ],
+    [  # 第 4 页 · 补差类 + 负样本
+        ("chat_input", "聊天框"),
+        ("open_tree_icon", "好友树"),
+        ("accept_carry", "背背"),
+        ("shoulder", "搭肩"),
+        ("whisper", "耳语"),
+        ("negative", "负样本"),
     ],
 ]
+PAGE_TITLES = ["新增正类", "P0 老类补采 A", "P0/P1 老类补采 B", "补差类 + 负样本"]
+
+# 每类"本轮还要补多少"（2026-11-02 改：从"总目标"改为"本轮新增目标"，
+# 按钮显示 本轮已采/目标；启动时统计采集目录里已有的图片数，到目标会响铃提醒）
+# 2026-11-02 晚：按用户要求"全类补齐、攒够一次训练"，把 28 类 + negative 全部加上。
+TARGETS = {
+    # 第 1 页 · 新增正类
+    "instrument": 180, "settings_menu": 200, "butterfly_lure": 180,
+    "action_cancel": 160, "princess_hug": 80, "duo_dance": 80,
+    # 第 2 页 · P0 老类补采 A
+    "accept_hug": 250, "accept_high_five": 200, "follow": 200, "focus": 200,
+    "seat": 180, "mutual_light": 180, "hand_icon": 200, "bear_hug": 200,
+    "wing_light": 200,
+    # 第 3 页 · P0/P1 老类补采 B
+    "curtain_call": 200, "fancy_high_five": 200, "head_pat": 150,
+    "play_fight": 200, "spin_dance": 200, "accept_fist_bump": 150,
+    "light": 160, "handshake": 100,
+    # 第 4 页 · 补差类 + 负样本
+    "chat_input": 80, "open_tree_icon": 80, "accept_carry": 80,
+    "shoulder": 80, "whisper": 80, "negative": 300,
+}
+
+# 每类"要拍什么"的中文提示（选中时显示在左下状态栏）
+HINTS = {
+    "instrument": "要拍：乐器界面（弹琴中/刚打开/不同乐器）、面板开与关、近/远、白天/夜晚",
+    "settings_menu": "要拍：误开的设置菜单（主菜单/子页）、不同地图、面板开/关、半透明淡入淡出",
+    "butterfly_lure": "要拍：引蝶图标（近/中/远）、白天/夜晚/举火、单人/多人同屏",
+    "action_cancel": "要拍：持续动作取消按钮（背背/牵手/公主抱中）、不同地图/光照、被人物遮挡",
+    "princess_hug": "要拍：公主抱邀请图标（近/中/远）、夜晚/雨天、多人同屏、半透明",
+    "duo_dance": "要拍：双人舞邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "accept_hug": "要拍：抱抱邀请图标（近/中/远）、白天/夜晚/举火、单人/双人/多人重叠、面板开/关、半透明/被遮挡",
+    "accept_high_five": "要拍：击掌邀请图标（近/中/远）、不同地图/光照、多人同屏、面板开/关",
+    "follow": "要拍：跟随图标（好友树打开后头顶变跟随）、近/远、不同地图、被人物遮挡",
+    "focus": "要拍：聚焦图标（近/远、不同场景）、面板开/关、半透明",
+    "seat": "要拍：打坐/座位图标（近/远）、不同地图/光照、被遮挡",
+    "mutual_light": "要拍：星盘互火图标（近/远）、不同地图、多人星盘",
+    "hand_icon": "要拍：牵手图标（对方伸手瞬间；近/中/远、正/侧/斜）、不同地图/光照/多人、面板开/关",
+    "bear_hug": "要拍：熊抱邀请图标（近/中/远）、夜晚/雨天/举火、多人同屏、半透明/被遮挡",
+    "wing_light": "要拍：光翼（小金人）拾取图标（近/远、不同地图）、面板开/关、被遮挡；注意无翼号不要真捡",
+    "curtain_call": "要拍：谢幕邀请图标（近/中/远）、夜晚/举火、多人同屏",
+    "fancy_high_five": "要拍：花式击掌邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "head_pat": "要拍：摸头邀请图标（近/中/远）、不同地图/光照、多人同屏、半透明",
+    "play_fight": "要拍：打闹邀请图标（近/中/远）、夜晚/雨天、多人同屏、移动中",
+    "spin_dance": "要拍：共舞邀请图标（近/中/远）、不同地图/光照、多人同屏、半透明",
+    "accept_fist_bump": "要拍：碰拳邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "light": "要拍：点火图标（近/远）、不同地图/光照、面板开/关",
+    "handshake": "要拍：握手邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "chat_input": "要拍：聊天输入框/历史面板（开/关、输入态/非输入态、不同地图、半透明）",
+    "open_tree_icon": "要拍：好友树入口图标（近/中/远）、不同地图/光照、被人物遮挡、多人同屏",
+    "accept_carry": "要拍：背背邀请图标（近/中/远）、不同地图/光照、多人同屏、半透明",
+    "shoulder": "要拍：搭肩邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "whisper": "要拍：耳语邀请图标（近/中/远）、不同地图/光照、多人同屏",
+    "negative": "要拍：圆形 F 但不是互动的图标——星盘点火/传送、衣柜换装、纸船/留影、爱心牌、乐器音符、好友树内部按钮、别人头顶 F；空标签不画框",
+}
 FLAT = [t for _page in PAGES for t in _page]
 EN_TO_CN = {en: cn for en, cn in FLAT}
+
+
+def count_existing():
+    """统计采集目录里每类已有图片数（用于按钮上的"已采/目标"，重启不清零）。"""
+    out = {}
+    for en, _ in FLAT:
+        d = os.path.join(SAVE_ROOT, en)
+        n = 0
+        try:
+            if os.path.isdir(d):
+                for fn in os.listdir(d):
+                    if fn.lower().endswith((".png", ".jpg", ".jpeg")):
+                        n += 1
+        except OSError:
+            pass
+        out[en] = n
+    return out
 NEGATIVE_EN = "negative"
-# 每个类标记用途，用于按钮视觉区分
-NEGATIVE_SET = {"negative", "replay", "paper_boat", "music_note", "outfit"}
+# 第 2 页的 negative 是负样本类（按钮灰色显示）；小键盘 0 可快速切到它。
+NEGATIVE_SET: set = {"negative"}
 
 # 小键盘数字（开 NumLock）-> 当前页内索引（0-8）；N0 单独快速切负样本
 NUMPAD_DIGIT = {0x61: 0, 0x62: 1, 0x63: 2, 0x64: 3, 0x65: 4,
@@ -421,7 +495,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self.page_start.append(acc)
             acc += len(page)
 
-        self.counts = {en: 0 for en, _ in FLAT}
+        self.counts = count_existing()
+        self._hit = set()          # 已提醒过"达标"的类
         self.cur = 0
         self.burst = False
         self.dup_streak = 0
@@ -463,6 +538,14 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.refresh_selection()
         self.refresh_status()
+
+        # 启动时汇总本轮补采进度（目标在 TARGETS 里，按"本轮新增"算）
+        _todo = sum(max(0, v - self.counts.get(en, 0)) for en, v in TARGETS.items() if v)
+        _ok = sum(1 for en, v in TARGETS.items() if v and self.counts.get(en, 0) >= v)
+        _n = sum(1 for v in TARGETS.values() if v)
+        print("  本轮补采目标：%d 类 / 还差 %d 张（已达标 %d 类）"
+              % (_n, _todo, _ok))
+        print("  采集目录：%s（已有图片计入进度，重启不清零）" % SAVE_ROOT)
 
     # ── 界面构建 ──────────────────────────────────────────────────────
     def _build_ui(self):
@@ -550,7 +633,9 @@ class MainWindow(QtWidgets.QMainWindow):
         warn.setObjectName("warnBar")
         wl = QtWidgets.QHBoxLayout(warn)
         wl.setContentsMargins(10, 6, 10, 6)
-        wt = QtWidgets.QLabel("⚠ wing_light（光翼）只准远距离截图，绝不靠近、绝不按 F，无翼小号捡了不可逆！")
+        wt = QtWidgets.QLabel("本轮补采（按 2026-10-31 补采清单）：P0 老类（抱抱/击掌/跟随/光翼/聚焦/打坐/互火/牵手/熊抱/"
+                               "谢幕/花式击掌/摸头/打闹/共舞）+ 新类 + 困难负样本；按钮上的 N/目标 是进度。"
+                               "注意：无翼号不要真捡光翼（不可逆）。")
         wt.setObjectName("warnText")
         wl.addWidget(wt)
         backend_lbl = QtWidgets.QLabel("后端：%s" % self.backend)
@@ -639,7 +724,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 page = pi
                 break
         self.stack.setCurrentIndex(page)
-        self.page_label.setText("第 %d / %d 页" % (page + 1, len(PAGES)))
+        self.page_label.setText("第 %d / %d 页 · %s"
+                                % (page + 1, len(PAGES), PAGE_TITLES[page]))
         for en, btn in self.type_buttons.items():
             idx = next(i for i, (e, _) in enumerate(FLAT) if e == en)
             btn.setProperty("selected", idx == self.cur)
@@ -651,12 +737,25 @@ class MainWindow(QtWidgets.QMainWindow):
         if btn is None:
             return
         cn = EN_TO_CN[en]
-        btn.setText("%s\n%s\n%d 张" % (cn, en, self.counts[en]))
+        target = TARGETS.get(en)
+        if target:
+            btn.setText("%s\n%s\n%d/%d 张" % (cn, en, self.counts[en], target))
+        else:
+            btn.setText("%s\n%s\n%d 张" % (cn, en, self.counts[en]))
 
     def refresh_status(self):
         en, cn = FLAT[self.cur]
-        self.status_text.setText("当前：<b>%s（%s）</b>　本类已采 <b>%d</b> 张"
-                                 % (cn, en, self.counts[en]))
+        target = TARGETS.get(en)
+        if target:
+            left = max(0, target - self.counts[en])
+            tgt = (" / 目标 %d（%s）" % (target, "已达标 ✔" if left == 0 else "还差 %d" % left))
+        else:
+            tgt = ""
+        hint = HINTS.get(en, "")
+        self.status_text.setText(
+            "当前：<b>%s（%s）</b>　本轮已采 <b>%d</b> 张%s%s"
+            % (cn, en, self.counts[en], tgt,
+               ("<br><span style='color:#7a4b00'>%s</span>" % hint) if hint else ""))
         try:
             user32.SetConsoleTitleW("采集 [%s/%s] 连拍=%s"
                                     % (en, cn, "开" if self.burst else "关"))
@@ -703,6 +802,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dup_streak = 0
         self.refresh_button(en)
         self.refresh_status()
+        tgt = TARGETS.get(en)
+        if tgt and self.counts[en] >= tgt and en not in self._hit:
+            self._hit.add(en)
+            beep(1500, 100)
+            time.sleep(0.12)
+            beep(1900, 120)
+            print("  ✔ [%s/%s] 已达本轮目标 %d 张！可以换下一类了（F8 下一类 / F6 翻页）"
+                  % (en, cn, tgt))
         if manual:
             beep(1200, 40)
             print("  [%s/%s] 第 %d 张（画面变化 %.1f）" % (en, cn, self.counts[en], diff))
@@ -726,14 +833,20 @@ class MainWindow(QtWidgets.QMainWindow):
             self.preview_timer.stop()
             self.poll_timer.stop()
             self.cap.stop()
-            print("\n=== 本次采集统计 ===")
+            print("\n=== 本轮采集统计（累计，含之前已采） ===")
             total = 0
+            left = 0
             for en, cn in FLAT:
                 n = self.counts[en]
                 total += n
-                if n:
+                tgt = TARGETS.get(en)
+                if tgt:
+                    left += max(0, tgt - n)
+                    print("  %s (%s): %d/%d 张%s" % (en, cn, n, tgt,
+                                                    "" if n < tgt else "  ✔达标"))
+                elif n:
                     print("  %s (%s): %d 张" % (en, cn, n))
-            print("  合计：%d 张；保存目录：%s" % (total, SAVE_ROOT))
+            print("  合计：%d 张；目标还差 %d 张；保存目录：%s" % (total, left, SAVE_ROOT))
         event.accept()
 
 

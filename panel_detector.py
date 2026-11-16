@@ -271,6 +271,10 @@ class DetectorConfig:
     # 好友树判据＝右上角标题栏"人形+齿轮"标识：真机1080p两帧模板分0.998、中心(0.832,0.032)、
     # 1:1命中；聊天/普通帧最高仅0.66且误报点在顶部正中(0.50)被本ROI切掉。ROI只包右上顶部条。
     roi_friend_tree: tuple = (0.74, 0.00, 0.93, 0.10)
+    # 遇境（家园）三类圆形图标：感叹号任务/星芒先祖兑换树/三人形好友列表。
+    # 圆心随相机视角漂移（实测归一化 x0.247~0.452、y0.385~0.884），不能用固定坐标，
+    # 用模板匹配；ROI 包全部实测圆心并留余量。只识别+日志，不接按键。
+    roi_home_icons: tuple = (0.18, 0.32, 0.55, 0.93)
 
     # 聊天面板视觉阈值（2026-07-02 夜景+亮景实拍标定）。
     # 判据 = 满宽暗行：输入框横贯搜索带（行暗占比 0.88~1.0），
@@ -320,6 +324,11 @@ class DetectorConfig:
     # f_prompt（牵手/点火F提示）专用阈值：牵手图标在不同背景下匹配分约0.60~0.70，
     # 全局0.82太高导致漏检。0.58 能命中且误报风险低（F提示图标形状独特）
     f_prompt_threshold: float = 0.70
+    # 遇境 home_icons 三图标各自阈值（597 张真实截图反证标定：真图标下限 vs 纯误报上限）
+    # 感叹号真图标≥0.885/纯误报≤0.70；星芒F真图标≥0.652/纯误报≤0.503；三人形G真图标≥0.859/纯误报≤0.648
+    home_quest_threshold: float = 0.80     # quest_excl 感叹号：领取/提交任务
+    home_ancestor_threshold: float = 0.60  # ancestor_star 星芒F：常驻先祖兑换树（窗口最窄）
+    home_friend_threshold: float = 0.80    # friend_group 三人形G：好友列表
     template_scales: tuple = (0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
     template_every_n: int = 3         # 每N帧才匹配一次（matchTemplate较贵，与游戏同机要省CPU）
 
@@ -569,7 +578,7 @@ class WorldState:
 class TemplateBank:
     """templates/<channel>/*.png，灰度多尺度匹配。目录不存在则静默禁用。"""
 
-    CHANNELS = ("chat", "friend_tree", "confirm", "f_prompt", "home", "hint_bar")
+    CHANNELS = ("chat", "friend_tree", "confirm", "f_prompt", "home", "home_icons", "hint_bar")
 
     def __init__(self, cfg: DetectorConfig):
         self.cfg = cfg
@@ -627,6 +636,22 @@ class TemplateBank:
 
     def match(self, gray_roi: np.ndarray, channel: str, frame_h: int) -> float:
         return self.match_named(gray_roi, channel, frame_h)[0]
+
+    def match_each_named(self, gray_roi: np.ndarray, channel: str,
+                         frame_h: int) -> list[tuple[str, float]]:
+        """返回通道内每个模板（跨多尺度取最高）的 [(模板名, 分数)]，无模板返回 []。
+        用于同屏可能出现多个图标的通道（如遇境星盘 F+G 同时在）。"""
+        if channel not in self.bank:
+            return []
+        per: dict[str, float] = {}
+        for name, tmpl in self._scaled(channel, frame_h):
+            th, tw = tmpl.shape[:2]
+            if th >= gray_roi.shape[0] or tw >= gray_roi.shape[1]:
+                continue
+            score = float(cv2.matchTemplate(gray_roi, tmpl, cv2.TM_CCOEFF_NORMED).max())
+            if name not in per or score > per[name]:
+                per[name] = score
+        return list(per.items())
 
 
 # ===================== 窗口定位（仅 Windows） =====================
@@ -1062,7 +1087,24 @@ class PanelDetector:
                 if changed:
                     w._emit("friend_tree", False, True)
 
-        # ---- 6. TTL 到期回落 + 周期全帧 OCR ----
+        # ---- 6. 遇境家园图标（只识别+日志：不接按键、不改布尔状态/结构） ----
+        if run_tmpl and self.templates.has("home_icons"):
+            thr_map = {
+                "quest_excl": self.cfg.home_quest_threshold,
+                "ancestor_star": self.cfg.home_ancestor_threshold,
+                "friend_group": self.cfg.home_friend_threshold,
+            }
+            best_score = -1.0
+            for tname, score in self.templates.match_each_named(
+                    _crop(gray, self.cfg.roi_home_icons), "home_icons", h):
+                if score > best_score:
+                    best_score = score
+                thr = thr_map.get(tname, 1.0)
+                if score >= thr:
+                    print(f"[HomeIcon] 命中 {tname} 分数={score:.3f} (阈值{thr:.2f})")
+            m["tmpl_home"] = best_score
+
+        # ---- 7. TTL 到期回落 + 周期全帧 OCR ----
         with w._lock:
             for ch, name in ((w.confirm, "confirm"),
                              (w.friend_tree, "friend_tree"),
@@ -1525,13 +1567,33 @@ def _region_from_mcp(url: str, token: str) -> dict:
             "width": win["width"], "height": win["height"]}
 
 
+def _default_mcp_token() -> str:
+    """MCP Bearer token 的默认值（2026-11-13：不再写死 1234）。
+
+    2026-11-01 起 MCP 改成**每次首次启动生成随机 token** 存到 user_data/mcp_token.txt，
+    所以标定工具里那个写死的 1234 会让 `py panel_detector.py --dump` 直接 401。
+    解析顺序：环境变量 SKY_MCP_TOKEN -> user_data/mcp_token.txt -> 空串（鉴权失败时提示）。
+    """
+    tok = (os.environ.get("SKY_MCP_TOKEN") or "").strip()
+    if tok:
+        return tok
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                     "user_data", "mcp_token.txt")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser(description="光遇 PanelDetector 冒烟测试")
     ap.add_argument("--region", help="L,T,W,H 手动指定截屏区域（默认自动找游戏窗口）")
     ap.add_argument("--mcp-url", default="http://127.0.0.1:9900",
                     help="兜底：从 MCP status 拿窗口区域")
-    ap.add_argument("--token", default="1234")
+    ap.add_argument("--token", default=_default_mcp_token(),
+                    help="MCP Bearer token（默认读 user_data/mcp_token.txt 或 SKY_MCP_TOKEN）")
     ap.add_argument("--dump", action="store_true",
                     help="保存整帧和各 ROI 截图后退出（标定用）")
     ap.add_argument("--debug", action="store_true")

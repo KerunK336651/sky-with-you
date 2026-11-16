@@ -1,82 +1,123 @@
 # -*- coding: utf-8 -*-
 """
-YOLOv8 训练脚本
+YOLOv8 训练脚本（GPU 优先，自动回退 CPU；家里 R7 7700 已优化）
 用法：
-  1. 修改下面的 DATASET_PATH 为你的数据集路径
-  2. 运行: py train_yolo.py
-  3. 训练完成后模型在 runs/detect/train/weights/best.pt
+  py train_yolo.py                    # 训练（自动识别 GPU/CPU）
+  py train_yolo.py D:\path\data.yaml  # 手动指定 data.yaml
+  py train_yolo.py --resume           # 中断后断点续训
+完成后：
+  runs/detect/sky_v7_28cls/weights/best.pt
 """
 import os
 import sys
+import argparse
 
 # ========== 配置 ==========
-DATASET_PATH = r"D:\yolo_dataset_v3"   # 改成你的数据集解压路径
-MODEL_SIZE = "yolov8n.pt"            # nano版，最快，适合实时
-EPOCHS = 100                          # 训练轮数
-IMGSZ = 640                            # 图片尺寸
-BATCH = 8                              # 批次大小（CPU训练调小一点）
+DEFAULT_DATA = r"D:\sky_yolo_train_v7_28cls\data.yaml"
+MODEL = "yolov8n.pt"
+EPOCHS = 100
+IMGSZ = 960
+PATIENCE = 20
+GPU_BATCH = 16
+GPU_WORKERS = 8
+CPU_BATCH = 8          # CPU 稳妥值（v5 在 R7 实测）
 # ==========================
 
-def main():
-    # 检查数据集路径
-    data_yaml = os.path.join(DATASET_PATH, "data.yaml")
-    if not os.path.exists(data_yaml):
-        print(f"错误: 找不到 {data_yaml}")
-        print(f"请确认数据集已解压到 {DATASET_PATH}")
-        print(f"目录下应该有 data.yaml、train/、valid/、test/ 文件夹")
+
+def prevent_sleep():
+    """训练期间阻止系统自动睡眠/关屏（不影响手动锁屏）。"""
+    try:
+        import ctypes
+        ES_CONTINUOUS = 0x80000000
+        ES_SYSTEM_REQUIRED = 0x00000001
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        print("[防睡眠] 训练期间已阻止系统自动睡眠")
+    except Exception as e:
+        print("[防睡眠] 设置失败，请手动在电源选项里关闭睡眠：", e)
+
+
+def resume_train():
+    last = r"runs/detect/sky_v7_28cls/weights/last.pt"
+    if not os.path.exists(last):
+        print("找不到", last, "，无法续训（确认之前已训练过）。")
         sys.exit(1)
-    
+    from ultralytics import YOLO
+    print("从 last.pt 断点续训 ...")
+    YOLO(last).train(resume=True)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("data", nargs="?", default=DEFAULT_DATA)
+    ap.add_argument("--resume", action="store_true", help="断点续训")
+    args = ap.parse_args()
+
+    try:
+        import torch
+    except ImportError:
+        print("未安装 PyTorch。CPU 版安装：pip install torch torchvision")
+        sys.exit(1)
+
     print("=" * 50)
-    print("YOLOv8 训练")
+    print("PyTorch:", torch.__version__)
+    if torch.cuda.is_available():
+        device = 0
+        batch = GPU_BATCH
+        workers = GPU_WORKERS
+        amp = True
+        print("GPU:", torch.cuda.get_device_name(0))
+    else:
+        device = "cpu"
+        batch = CPU_BATCH
+        amp = False  # CPU 无 FP16 张量核心，用 FP32 最稳
+        nlogical = os.cpu_count() or 16
+        torch.set_num_threads(nlogical)
+        nphys = nlogical // 2
+        workers = max(2, min(6, nphys - 2))
+        print("CPU 训练（无 GPU）")
+        print("线程=%d workers=%d batch=%d" % (torch.get_num_threads(), workers, batch))
+        prevent_sleep()
     print("=" * 50)
-    print(f"数据集: {DATASET_PATH}")
-    print(f"模型: {MODEL_SIZE}")
-    print(f"轮数: {EPOCHS}")
-    print(f"图片尺寸: {IMGSZ}")
-    print(f"批次大小: {BATCH}")
-    print("=" * 50)
-    
-    # 检查 ultralytics 是否安装
+
+    if args.resume:
+        resume_train()
+        return
+
+    if not os.path.exists(args.data):
+        print("找不到 data.yaml:", args.data)
+        print("请确认数据集已解压，或把路径作为参数传入。")
+        sys.exit(1)
+
     try:
         from ultralytics import YOLO
     except ImportError:
-        print("正在安装 ultralytics...")
-        os.system(f"{sys.executable} -m pip install ultralytics")
+        print("正在安装 ultralytics ...")
+        os.system("%s -m pip install ultralytics" % sys.executable)
         from ultralytics import YOLO
-    
-    # 加载模型
-    print(f"\n加载模型 {MODEL_SIZE}...")
-    model = YOLO(MODEL_SIZE)
-    
-    # 训练
-    print("\n开始训练...")
-    print("（CPU训练可能需要1-2小时，请耐心等待）")
-    print()
-    
-    results = model.train(
-        data=data_yaml,
+
+    YOLO(MODEL).train(
+        data=args.data,
         epochs=EPOCHS,
         imgsz=IMGSZ,
-        batch=BATCH,
-        device="cpu",           # CPU训练（没有N卡）
-        workers=2,               # 数据加载线程数
+        batch=batch,
+        device=device,
+        workers=workers,
+        amp=amp,
         project="runs/detect",
-        name="train",
+        name="sky_v7_28cls",
         exist_ok=True,
-        patience=20,             # 20轮没提升就早停
+        patience=PATIENCE,
         save=True,
-        plots=True,              # 生成训练曲线图
+        plots=True,
         verbose=True,
     )
-    
+
     print("\n" + "=" * 50)
     print("训练完成！")
-    print(f"最佳模型: runs/detect/train/weights/best.pt")
-    print(f"最后模型: runs/detect/train/weights/last.pt")
+    print("best.pt: runs/detect/sky_v7_28cls/weights/best.pt")
     print("=" * 50)
-    print("\n下一步:")
-    print("  1. 运行 py test_yolo.py 测试模型效果")
-    print("  2. 把 best.pt 集成到主程序")
+
 
 if __name__ == "__main__":
     main()

@@ -44,8 +44,18 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 
 MCP_HOST = "127.0.0.1"
 MCP_PORT = 9900
-# sky-loop-v7.py 里 MCP_TOKEN 写死 1234，start_mcp.bat 也用 --token 1234
-MCP_TOKEN_DEFAULT = "1234"
+# 2026-11-01 P0：MCP token 不再写死 1234，改为 MCP 首次启动生成到
+# user_data/mcp_token.txt（sky-loop 读同一文件）；也支持 SKY_MCP_TOKEN 覆盖。
+MCP_TOKEN_FILE = os.path.join(ROOT, "user_data", "mcp_token.txt")
+
+
+def read_mcp_token_file():
+    """读本地 MCP token 文件；不存在返回空串。"""
+    try:
+        with open(MCP_TOKEN_FILE, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 # 与 panel_detector.DetectorConfig.window_titles 保持一致
 WINDOW_TITLES = ("光·遇", "Sky: Children of the Light", "光遇", "Sky")
@@ -57,7 +67,7 @@ CH340_VID = 0x1A86
 
 MODEL_REL = os.path.join("runs", "detect", "runs", "detect", "train", "weights", "best.pt")
 
-SOURCE_FILES = ("sky-loop-v7.py", "sky-mcp-server.py", "panel_detector.py", "mem_reader.py")
+SOURCE_FILES = ("sky-loop-v7.py", "sky-mcp-server.py", "panel_detector.py")
 CORE_FILES = ("llm_client.py", "memory.py", "reply_engine.py", "style_learner.py",
               "vision_client.py", "web_search.py")
 
@@ -118,6 +128,10 @@ class Probes:
     def __init__(self, root=ROOT, env=None):
         self.root = root
         self.env = dict(os.environ) if env is None else dict(env)
+
+    def mcp_token(self):
+        """MCP token：环境变量优先，其次本机 user_data/mcp_token.txt。"""
+        return (self.env.get("SKY_MCP_TOKEN") or read_mcp_token_file() or "").strip()
 
     def path(self, *parts):
         return os.path.join(self.root, *parts)
@@ -283,7 +297,8 @@ class Probes:
 def looks_like_mojibake(text):
     """检测"UTF-8 字节被按 ANSI/GBK 读"形成的乱码。
 
-    真实坑：bat 文件编码不统一时（start_loop_mem.bat 是 UTF-8，其余是 GBK），
+    真实坑：bat 文件编码不统一时（个别旧脚本是 UTF-8，其余是 GBK；旧内存模式脚本
+    start_loop_mem.bat 现已移入 research_游戏内存读取_仅研究/），
     cmd 按 ANSI 读会得到 '鐝傜弬' 这种串，env 里的白名单就再也匹配不上玩家名。
     判据：按 GBK 编回去能解成另一串合法中文 —— 只做提示，不做判定。
     """
@@ -552,7 +567,13 @@ def check_mcp(report, probes):
     report.ok("%d 端口可连" % port)
     base = "http://%s:%d" % (host, port)
 
-    status, obj, err = probes.http_json(base + "/health", timeout=1.5)
+    # 2026-11-01 P0：/health 也鉴权了，先取 token（环境变量优先，其次本机文件）
+    token = probes.mcp_token()
+    status, obj, err = probes.http_json(base + "/health", token=token, timeout=1.5)
+    if status == 401:
+        report.warn("%d 上跑着 MCP，但 /health 需要 token —— 本机没找到 user_data/mcp_token.txt"
+                    "（先启动一次 MCP 生成它），或 SKY_MCP_TOKEN 与运行中的 MCP 不一致" % port)
+        return
     if status == 200 and isinstance(obj, dict) and isinstance(obj.get("server"), dict):
         srv = obj["server"]
         report.ok("MCP 身份确认：%s %s | OCR=%s | 设备=%s"
@@ -563,13 +584,17 @@ def check_mcp(report, probes):
                     "start_mcp.bat" % (port, err or ("HTTP %s" % status)))
         return
 
-    token = (probes.env.get("SKY_MCP_TOKEN") or MCP_TOKEN_DEFAULT).strip()
+    if not token:
+        report.warn("没找到 MCP token（user_data/mcp_token.txt）—— 先启动一次 MCP 生成它")
     payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                "params": {"name": "status", "arguments": {}}}
     status2, obj2, err2 = probes.http_json(base, payload=payload, token=token, timeout=3.0)
     if status2 == 401:
-        report.warn("MCP token 不匹配（自检用的是 %s）—— start_mcp.bat 的 --token 要和 "
-                    "sky-loop-v7.py 里的 MCP_TOKEN 一致" % token)
+        if not token:
+            report.warn("MCP 需要 token，但本机没有 user_data/mcp_token.txt —— 先启动一次 MCP 生成它")
+        else:
+            report.warn("MCP token 不匹配（本机用 %s…）—— 运行的 MCP 可能是旧 token 启动的，"
+                        "重启 start_mcp.bat 让它重新读 user_data/mcp_token.txt" % token[:6])
         return
     if status2 != 200 or not isinstance(obj2, dict):
         report.warn("MCP status 调用失败：%s" % (err2 or ("HTTP %s" % status2)))
@@ -601,7 +626,6 @@ CONFIG_KEYS = (
     ("SKY_LLM_MODEL", "代码默认"),
     ("SKY_INPUT_BACKEND", "arduino"),
     ("SKY_SERIAL_PORT", "留空=自动探测"),
-    ("SKY_MEM_READER", "0=OCR截图"),
     ("SKY_WHITELIST_ENABLED", "1"),
     ("SKY_WHITELIST", "珂珂"),
     ("SKY_YOLO_ENABLED", "1"),
@@ -620,8 +644,8 @@ def check_config(report, probes):
         report.out("  %-22s = %s" % (key, probes.env.get(key, "<未设, 默认 " + default + ">")))
 
     if probes.env.get("SKY_MEM_READER") == "1":
-        report.warn("内存读取模式：必须管理员权限；网易易盾会识别内存扫描，有封号风险（只建议测试号）；"
-                    "该模式下 OCR 线程不启动")
+        report.warn("SKY_MEM_READER 已移出运行时（2026-10-31）：内存读取代码在 "
+                    "research_游戏内存读取_仅研究/（仅研究、禁止实际/违法使用），该设置不会生效")
 
     wl = probes.env.get("SKY_WHITELIST")
     if wl is not None:
