@@ -36,8 +36,8 @@ TA 会自己看聊天面板、回你的消息、点火收火、鞠躬、接受�
 
 **看 · 视觉感知**
 - 截屏 + 视觉特征 + 模板匹配 + OCR 三路融合，维护线程安全的世界状态
-- YOLO 图标识别：随仓库提供 22 类权重（互动动作、好友树、光翼、聊天框等），
-  另有 12 类、7 类版本；不装 YOLO 时自动退回模板匹配
+- YOLO 图标识别：随仓库提供 28 类权重（互动动作、好友树、光翼、聊天框、乐器、设置菜单等），
+  另有 22 类、12 类、7 类历史版本；不装 YOLO 时自动退回模板匹配
 - 多 OCR 引擎读取聊天文字，支持 DirectML 显卡加速
 - 场景识别：你问"这是哪里"时自动判断当前地图
 - 视觉大模型（VLM）按需调用，理解画面内容
@@ -125,8 +125,11 @@ python -m pip install -r requirements.txt
    写上你的 TA 是谁（协议段落别删）
 3. **模板**：`templates/` 目录随代码放在一起（1080p 基准，自动缩放）
 4. **视觉模型**：预训练权重随仓库放在 [`models/yolo/`](models/yolo/)，
-   最新为 `sky_v6_22cls_best.pt`（22 类），另含 12 类（`sky_v5_12cls_best.pt`）、
-   7 类（`sky_v4_7cls_best.pt`）版本；权重以 CC BY-NC-SA 4.0 发布。
+   最新为 `sky_v8_28cls_best.pt`（28 类），另含同 28 类的 `sky_v7_28cls_best.pt`，
+   以及 22 类（`sky_v6_22cls_best.pt`）、12 类（`sky_v5_12cls_best.pt`）、
+   7 类（`sky_v4_7cls_best.pt`）历史版本；权重以 CC BY-NC-SA 4.0 发布。
+   另提供 v8 的 ONNX（`sky_v8_28cls_best.onnx`）与 OpenVINO
+   （`sky_v8_28cls_best_openvino_model/`）两种部署格式，便于无 PyTorch 或 CPU 加速场景使用。
    把对应权重放到程序默认模型路径即可，也可用 `train_yolo.py` 自行采集
    标注后训练。基础模型 `yolov8n.pt` 由 ultralytics 首次运行自动下载。
    不装 YOLO 也能靠模板匹配正常运行。

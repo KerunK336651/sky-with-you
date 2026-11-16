@@ -1,7 +1,8 @@
 # 模型权重许可证
 
 本项目的 YOLO 模型权重文件（包括但不限于 `best.pt`、`last.pt`，以及各版本
-`sky_v4_7cls`、`sky_v5_12cls`、`sky_v6_22cls` 权重，通过 GitHub Release 分发）
+`sky_v4_7cls`、`sky_v5_12cls`、`sky_v6_22cls`、`sky_v7_28cls`、`sky_v8_28cls`
+权重，以及由权重导出的 ONNX、OpenVINO 部署文件，通过 GitHub Release 分发）
 由 **珂珂（KerunK336651）** 训练并发布，采用：
 
 ## Creative Commons 署名-非商业性使用-相同方式共享 4.00 国际（CC BY-NC-SA 4.0）

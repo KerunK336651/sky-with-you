@@ -1,0 +1,51 @@
+description: Ultralytics sky_v8_28cls_best model trained on D:\sky_yolo_train_v7_28cls\data.yaml
+author: Ultralytics
+date: '2026-11-09T20:45:24.297685+08:00'
+version: 8.4.137
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 32
+task: detect
+head: Detect
+batch: 1
+imgsz:
+- 960
+- 960
+names:
+  0: chat_input
+  1: hand_icon
+  2: open_tree_icon
+  3: accept_hug
+  4: accept_carry
+  5: accept_high_five
+  6: accept_fist_bump
+  7: follow
+  8: wing_light
+  9: light
+  10: focus
+  11: seat
+  12: bear_hug
+  13: curtain_call
+  14: fancy_high_five
+  15: handshake
+  16: head_pat
+  17: mutual_light
+  18: play_fight
+  19: shoulder
+  20: spin_dance
+  21: whisper
+  22: instrument
+  23: settings_menu
+  24: butterfly_lure
+  25: action_cancel
+  26: princess_hug
+  27: duo_dance
+args:
+  data: null
+  batch: 1
+  fraction: 1.0
+  quantize: null
+  dynamic: false
+  nms: false
+channels: 3
+end2end: false
